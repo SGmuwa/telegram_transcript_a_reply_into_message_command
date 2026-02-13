@@ -8,7 +8,7 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List, Set
 
@@ -463,12 +463,26 @@ async def process_transcription_job(
         # --- DOWNLOAD ---
         total = getattr(getattr(reply_msg, "file", None), "size", None)
         last_pct = -1
+        download_start = time.monotonic()
 
         def dl_progress(current: int, total_bytes: int):
             nonlocal last_pct
             t = total_bytes if total_bytes else total
             if t and t > 0:
                 pct = int(min(99, max(0, (current / t) * 100)))
+                # Предсказание даты завершения по скорости
+                done_ts_predicted: Optional[str] = None
+                if current > 0:
+                    elapsed = time.monotonic() - download_start
+                    if elapsed >= 0.5:
+                        speed = current / elapsed
+                        remaining = t - current
+                        if speed > 0:
+                            eta_sec = remaining / speed
+                            done_ts_predicted = (
+                                datetime.now().astimezone() + timedelta(seconds=eta_sec)
+                            ).strftime("%Y-%m-%d %H:%M:%S %z")
+                state.done_ts = done_ts_predicted
                 if pct != last_pct:
                     last_pct = pct
                     state.pct = pct
@@ -477,6 +491,7 @@ async def process_transcription_job(
             else:
                 state.pct = None
                 state.note = "прогресс неизвестен"
+                state.done_ts = None
                 low_update()
 
         downloaded_path = await client.download_media(
