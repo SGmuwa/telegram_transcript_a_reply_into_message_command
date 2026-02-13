@@ -597,6 +597,8 @@ async def process_transcription_job(
         if not duration or duration <= 0:
             duration = None
 
+        transcribe_start = time.monotonic()
+
         def transcribe_blocking() -> Tuple[str, dict]:
             model = model_cache.get(model_name)
             segments, info = model.transcribe(
@@ -612,14 +614,22 @@ async def process_transcription_job(
                 out_chunks.append(seg.text)
                 if duration:
                     pct = int(min(99, max(0, (seg.end / duration) * 100)))
-                    nonlocal_state_pct = pct
-                    # обновляем state из треда — thread-safe через scheduler
-                    if nonlocal_state_pct != last_pct_local:
-                        last_pct_local = nonlocal_state_pct
+                    if pct != last_pct_local:
+                        last_pct_local = pct
+                        # Предсказание даты завершения транскрипции (как при скачивании)
+                        done_ts_predicted: Optional[str] = None
+                        if pct > 0:
+                            elapsed = time.monotonic() - transcribe_start
+                            if elapsed >= 0.5:
+                                eta_sec = (100 - pct) / pct * elapsed
+                                done_ts_predicted = datetime_in_tz(
+                                    datetime.now().astimezone() + timedelta(seconds=eta_sec),
+                                    tz_name,
+                                )
                         scheduler.request_threadsafe(
                             state.chat_id,
                             state.cmd_msg_id,
-                            build_progress_text("transcribe", nonlocal_state_pct, None, None),
+                            build_progress_text("transcribe", pct, done_ts_predicted, None),
                         )
             return "".join(out_chunks).strip(), {
                 "language": getattr(info, "language", None),
