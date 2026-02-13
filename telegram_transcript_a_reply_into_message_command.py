@@ -10,6 +10,7 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Dict, Optional, Tuple, List, Set
 
 from loguru import logger
@@ -29,6 +30,7 @@ logger.add(sys.stderr, level=LOG_LEVEL, format="<green>{time:YYYY-MM-DD HH:mm:ss
 # Defaults (можно переопределять env-ами и через команду)
 DEFAULT_MODEL_NAME = os.getenv("DEFAULT_MODEL_NAME", "large")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ru")
+DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Europe/Moscow")
 LOW_PRIORITY_EDIT_INTERVAL_SECONDS = int(os.getenv("LOW_PRIORITY_EDIT_INTERVAL_SECONDS", "120"))
 
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "./.tmp")).resolve()
@@ -44,6 +46,26 @@ TELEGRAM_MAX_MESSAGE_LEN = 4096  # безопасно считать 4096
 
 def now_local_str() -> str:
     return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def now_in_tz(tz_name: str) -> str:
+    """Текущее время в указанной таймзоне (например Europe/Moscow). При ошибке — Europe/Moscow."""
+    try:
+        zi = ZoneInfo(tz_name)
+        return datetime.now(zi).strftime("%Y-%m-%d %H:%M:%S %z")
+    except Exception:
+        zi = ZoneInfo(DEFAULT_TZ)
+        return datetime.now(zi).strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def datetime_in_tz(dt: datetime, tz_name: str) -> str:
+    """Форматирует datetime в указанной таймзоне."""
+    try:
+        zi = ZoneInfo(tz_name)
+        return dt.astimezone(zi).strftime("%Y-%m-%d %H:%M:%S %z")
+    except Exception:
+        zi = ZoneInfo(DEFAULT_TZ)
+        return dt.astimezone(zi).strftime("%Y-%m-%d %H:%M:%S %z")
 
 
 def load_env_file_if_exists(path: Path) -> None:
@@ -125,7 +147,7 @@ def parse_command(text: str) -> Optional[dict]:
         else:
             return None
 
-    args = {"cmd": cmd, "model": None, "lang": None}
+    args = {"cmd": cmd, "model": None, "lang": None, "tz": None}
     for p in parts[1:]:
         if "=" not in p:
             continue
@@ -136,6 +158,8 @@ def parse_command(text: str) -> Optional[dict]:
             args["model"] = v
         elif k == "lang":
             args["lang"] = v
+        elif k == "tz":
+            args["tz"] = v
     logger.debug("parsed command: {}", args)
     return args
 
@@ -431,12 +455,13 @@ async def process_transcription_job(
     model_name: str,
     lang_force: Optional[str],
     lang_allowed: Optional[List[str]],
+    tz_name: str,
 ) -> None:
     # temp workspace
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     job_dir = TEMP_DIR / f"job_{chat_id}_{cmd_msg_id}"
     job_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("transcription job started chat_id={} cmd_msg_id={} model={} lang_force={} lang_allowed={}", chat_id, cmd_msg_id, model_name, lang_force, lang_allowed)
+    logger.info("transcription job started chat_id={} cmd_msg_id={} model={} lang_force={} lang_allowed={} tz={}", chat_id, cmd_msg_id, model_name, lang_force, lang_allowed, tz_name)
 
     src_path = job_dir / "source"
     wav_path = job_dir / "audio.wav"
@@ -479,9 +504,10 @@ async def process_transcription_job(
                         remaining = t - current
                         if speed > 0:
                             eta_sec = remaining / speed
-                            done_ts_predicted = (
-                                datetime.now().astimezone() + timedelta(seconds=eta_sec)
-                            ).strftime("%Y-%m-%d %H:%M:%S %z")
+                            done_ts_predicted = datetime_in_tz(
+                                datetime.now().astimezone() + timedelta(seconds=eta_sec),
+                                tz_name,
+                            )
                 state.done_ts = done_ts_predicted
                 if pct != last_pct:
                     last_pct = pct
@@ -506,7 +532,7 @@ async def process_transcription_job(
         logger.debug("job {}: download done -> {}", job_dir.name, downloaded_path)
         state.stage = "download"
         state.pct = 100
-        state.done_ts = now_local_str()
+        state.done_ts = now_in_tz(tz_name)
         state.note = None
         # переход делаем low-priority (как вы описали)
         low_update()
@@ -528,7 +554,7 @@ async def process_transcription_job(
         logger.debug("job {}: convert done", job_dir.name)
         state.stage = "convert"
         state.pct = 100
-        state.done_ts = now_local_str()
+        state.done_ts = now_in_tz(tz_name)
         state.note = None
         low_update()
 
@@ -584,7 +610,7 @@ async def process_transcription_job(
 
         state.stage = "transcribe"
         state.pct = 100
-        state.done_ts = now_local_str()
+        state.done_ts = now_in_tz(tz_name)
         state.note = None
         low_update()
 
@@ -726,7 +752,8 @@ async def main() -> None:
 
         model_name = cmd.get("model") or DEFAULT_MODEL_NAME
         lang_force, lang_allowed = normalize_lang(cmd.get("lang"))
-        logger.debug("starting transcription task: model={} lang_force={} lang_allowed={}", model_name, lang_force, lang_allowed)
+        tz_name = cmd.get("tz") or DEFAULT_TZ
+        logger.debug("starting transcription task: model={} lang_force={} lang_allowed={} tz={}", model_name, lang_force, lang_allowed, tz_name)
 
         # отдельная задача на обработку, чтобы не блокировать обработчик событий
         asyncio.create_task(
@@ -740,6 +767,7 @@ async def main() -> None:
                 model_name=model_name,
                 lang_force=lang_force,
                 lang_allowed=lang_allowed,
+                tz_name=tz_name,
             )
         )
 
