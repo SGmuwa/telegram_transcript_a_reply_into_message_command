@@ -989,7 +989,7 @@ async def main() -> None:
         if not sub.get(media_type, False):
             return
         try:
-            await client.send_message(chat_id, "/tr", reply_to=event.message.id)
+            await client.send_message(chat_id, "/tr", reply_to=event.message.id, silent=True)
             logger.debug("auto-sent /tr in chat_id={} for media type {}", chat_id, media_type)
         except Exception as e:
             logger.warning("auto /tr send failed chat_id={}: {}", chat_id, e)
