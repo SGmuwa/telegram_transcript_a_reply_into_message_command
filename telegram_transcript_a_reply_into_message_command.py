@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
+from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 
@@ -19,6 +20,11 @@ from faster_whisper import WhisperModel
 
 
 APP_NAME = "telegram_transcript_a_reply_into_message_command"
+
+# Уровень логирования: DEBUG по умолчанию (LOG_LEVEL=INFO для продакшена)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
+logger.remove()
+logger.add(sys.stderr, level=LOG_LEVEL, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>")
 
 # Defaults (можно переопределять env-ами и через команду)
 DEFAULT_MODEL_NAME = os.getenv("DEFAULT_MODEL_NAME", "large")
@@ -45,7 +51,9 @@ def load_env_file_if_exists(path: Path) -> None:
     Примитивный загрузчик KEY=VALUE (без кавычек/экранирований).
     """
     if not path.exists():
+        logger.debug("env file not found: {}", path)
         return
+    logger.debug("loading env from {}", path)
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -57,12 +65,14 @@ def load_env_file_if_exists(path: Path) -> None:
         v = v.strip()
         if k and k not in os.environ:
             os.environ[k] = v
+            logger.debug("env set {} (from file)", k)
 
 
 def ensure_secrets_example(secrets_dir: Path) -> None:
     secrets_dir.mkdir(parents=True, exist_ok=True)
     example = secrets_dir / "telegram.env.example"
     if not example.exists():
+        logger.info("creating example secrets file: {}", example)
         example.write_text(
             "\n".join([
                 "# Скопируйте в telegram.env и заполните значения",
@@ -126,6 +136,7 @@ def parse_command(text: str) -> Optional[dict]:
             args["model"] = v
         elif k == "lang":
             args["lang"] = v
+    logger.debug("parsed command: {}", args)
     return args
 
 
@@ -180,8 +191,10 @@ class LowPriorityEditScheduler:
         if key not in self._pending:
             self._pending[key] = text
             self._q.put_nowait(key)
+            logger.debug("scheduler: enqueued low-priority edit chat_id={} msg_id={}", chat_id, msg_id)
         else:
             self._pending[key] = text
+            logger.debug("scheduler: updated pending edit chat_id={} msg_id={}", chat_id, msg_id)
 
     def request_threadsafe(self, chat_id: int, msg_id: int, text: str) -> None:
         self._loop.call_soon_threadsafe(self.request, chat_id, msg_id, text)
@@ -189,10 +202,13 @@ class LowPriorityEditScheduler:
     async def _safe_edit(self, chat_id: int, msg_id: int, text: str) -> None:
         # Telegram может ругаться на "message not modified"
         try:
+            logger.debug("scheduler: editing chat_id={} msg_id={}", chat_id, msg_id)
             await self.client.edit_message(chat_id, msg_id, text)
         except MessageNotModifiedError:
+            logger.debug("scheduler: message not modified chat_id={} msg_id={}", chat_id, msg_id)
             return
         except FloodWaitError as e:
+            logger.warning("scheduler: FloodWait {}s for chat_id={} msg_id={}", e.seconds, chat_id, msg_id)
             await asyncio.sleep(int(e.seconds) + 1)
             await self.client.edit_message(chat_id, msg_id, text)
 
@@ -219,6 +235,7 @@ class WhisperModelCache:
 
     def get(self, model_name: str) -> WhisperModel:
         if model_name not in self._models:
+            logger.info("loading whisper model: {} (device={}, compute_type={})", model_name, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE)
             # download_root позволяет кэшировать модели в volume mount
             self._models[model_name] = WhisperModel(
                 model_name,
@@ -226,6 +243,7 @@ class WhisperModelCache:
                 compute_type=WHISPER_COMPUTE_TYPE,
                 download_root=str(MODEL_CACHE_DIR),
             )
+            logger.debug("whisper model loaded: {}", model_name)
         return self._models[model_name]
 
 
@@ -245,10 +263,14 @@ async def ffprobe_duration_seconds(input_path: Path) -> Optional[float]:
     )
     out, _ = await proc.communicate()
     if proc.returncode != 0:
+        logger.debug("ffprobe failed for {} returncode={}", input_path, proc.returncode)
         return None
     try:
-        return float(out.decode("utf-8").strip())
-    except Exception:
+        dur = float(out.decode("utf-8").strip())
+        logger.debug("ffprobe duration for {}: {}s", input_path, dur)
+        return dur
+    except Exception as e:
+        logger.debug("ffprobe parse error for {}: {}", input_path, e)
         return None
 
 
@@ -263,8 +285,10 @@ async def ffmpeg_convert_to_wav(
     """
     dur = await ffprobe_duration_seconds(input_path)
     if dur is None or dur <= 0:
+        logger.debug("ffmpeg_convert: duration unknown for {}", input_path)
         on_progress_pct(None, "прогресс неизвестен")
 
+    logger.debug("ffmpeg_convert: {} -> {}", input_path, output_path)
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg",
         "-y",
@@ -300,7 +324,9 @@ async def ffmpeg_convert_to_wav(
 
     rc = await proc.wait()
     if rc != 0:
+        logger.error("ffmpeg failed exit_code={} {} -> {}", rc, input_path, output_path)
         raise RuntimeError(f"ffmpeg failed with code {rc}")
+    logger.debug("ffmpeg_convert done: {}", output_path)
 
 
 def build_progress_text(stage: str, pct: Optional[int], done_ts: Optional[str], note: Optional[str]) -> str:
@@ -335,10 +361,13 @@ def build_progress_text(stage: str, pct: Optional[int], done_ts: Optional[str], 
 
 async def safe_edit_high_priority(client: TelegramClient, chat_id: int, msg_id: int, text: str) -> None:
     try:
+        logger.debug("high_priority edit chat_id={} msg_id={}", chat_id, msg_id)
         await client.edit_message(chat_id, msg_id, text[:TELEGRAM_MAX_MESSAGE_LEN])
     except MessageNotModifiedError:
+        logger.debug("high_priority edit: message not modified chat_id={} msg_id={}", chat_id, msg_id)
         return
     except FloodWaitError as e:
+        logger.warning("high_priority edit: FloodWait {}s chat_id={} msg_id={}", e.seconds, chat_id, msg_id)
         await asyncio.sleep(int(e.seconds) + 1)
         await client.edit_message(chat_id, msg_id, text[:TELEGRAM_MAX_MESSAGE_LEN])
 
@@ -367,6 +396,7 @@ async def process_transcription_job(
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     job_dir = TEMP_DIR / f"job_{chat_id}_{cmd_msg_id}"
     job_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("transcription job started chat_id={} cmd_msg_id={} model={} lang_force={} lang_allowed={}", chat_id, cmd_msg_id, model_name, lang_force, lang_allowed)
 
     src_path = job_dir / "source"
     wav_path = job_dir / "audio.wav"
@@ -383,6 +413,7 @@ async def process_transcription_job(
 
     try:
         # 9) high priority: старт скачивания
+        logger.debug("job {}: stage download 0%", job_dir.name)
         await safe_edit_high_priority(
             client, chat_id, cmd_msg_id,
             build_progress_text("download", 0, None, None)
@@ -413,8 +444,10 @@ async def process_transcription_job(
             progress_callback=dl_progress
         )
         if not downloaded_path:
+            logger.error("job {}: download failed", job_dir.name)
             raise RuntimeError("Не удалось скачать медиа из reply-сообщения")
 
+        logger.debug("job {}: download done -> {}", job_dir.name, downloaded_path)
         state.stage = "download"
         state.pct = 100
         state.done_ts = now_local_str()
@@ -423,6 +456,7 @@ async def process_transcription_job(
         low_update()
 
         # --- CONVERT ---
+        logger.debug("job {}: stage convert", job_dir.name)
         state.stage = "convert"
         state.pct = 0
         state.done_ts = None
@@ -435,6 +469,7 @@ async def process_transcription_job(
             low_update()
 
         await ffmpeg_convert_to_wav(Path(downloaded_path), wav_path, cvt_progress)
+        logger.debug("job {}: convert done", job_dir.name)
         state.stage = "convert"
         state.pct = 100
         state.done_ts = now_local_str()
@@ -442,6 +477,7 @@ async def process_transcription_job(
         low_update()
 
         # --- TRANSCRIBE ---
+        logger.debug("job {}: stage transcribe model={}", job_dir.name, model_name)
         state.stage = "transcribe"
         state.pct = 0
         state.done_ts = None
@@ -482,6 +518,7 @@ async def process_transcription_job(
             }
 
         text, meta = await asyncio.to_thread(transcribe_blocking)
+        logger.debug("job {}: transcribe done detected_lang={} len={}", job_dir.name, meta.get("language"), len(text or ""))
 
         # если пользователь задавал список языков — проверим detected (если есть)
         detected = meta.get("language")
@@ -499,8 +536,10 @@ async def process_transcription_job(
         final_msg = "🤖 Транскрипция:\n" + make_quote_block(text)
 
         if len(final_msg) <= TELEGRAM_MAX_MESSAGE_LEN:
+            logger.info("job {}: sending final message (inline)", job_dir.name)
             await safe_edit_high_priority(client, chat_id, cmd_msg_id, final_msg)
         else:
+            logger.info("job {}: sending final message as file (message too long)", job_dir.name)
             # Telegram не даёт «прикрепить файл» именно через edit текстового сообщения.
             # Практически достижимый вариант: отредактировать текст и ДОПОЛНИТЕЛЬНО отправить файл reply-ем.
             txt_path.write_text(text, encoding="utf-8")
@@ -508,6 +547,7 @@ async def process_transcription_job(
             await client.send_file(chat_id, str(txt_path), reply_to=cmd_msg_id)
 
     except Exception as e:
+        logger.exception("job chat_id={} cmd_msg_id={} failed: {}", chat_id, cmd_msg_id, e)
         await safe_edit_high_priority(client, chat_id, cmd_msg_id, format_error(e))
     finally:
         # гарантированная уборка временных файлов/директории
@@ -523,6 +563,7 @@ async def process_transcription_job(
                 pass
         except Exception:
             pass
+        logger.debug("job {}: temp dir removed", job_dir.name)
 
 
 async def main() -> None:
@@ -537,11 +578,11 @@ async def main() -> None:
     required_secrets = ["TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_PHONE", "TELEGRAM_SESSION_NAME"]
     ok, missing = require_env(required_secrets)
     if not ok:
-        print(f"[{APP_NAME}] Не заполнены секреты: {', '.join(missing)}", file=sys.stderr)
-        print(f"[{APP_NAME}] Введите значения через stdin (по одному на строку) или заполните {env_path}", file=sys.stderr)
+        logger.warning("missing secrets: {}", ", ".join(missing))
+        logger.info("enter values via stdin (one per line) or fill {}", env_path)
         for key in required_secrets:
             if not os.getenv(key):
-                print(f"[{APP_NAME}] {key}: ", end="", file=sys.stderr)
+                logger.info("{}: (waiting stdin)", key)
                 try:
                     value = sys.stdin.readline()
                 except (EOFError, KeyboardInterrupt):
@@ -550,9 +591,10 @@ async def main() -> None:
                     value = value.strip()
                 if value:
                     os.environ[key] = value
+                    logger.debug("{} set from stdin", key)
         ok, missing = require_env(required_secrets)
         if not ok:
-            print(f"[{APP_NAME}] Всё ещё не заполнены: {', '.join(missing)}. Выход.", file=sys.stderr)
+            logger.error("still missing: {}. Exit.", ", ".join(missing))
             return
 
     api_id = int(os.environ["TELEGRAM_API_ID"])
@@ -562,17 +604,20 @@ async def main() -> None:
     session_name = os.environ["TELEGRAM_SESSION_NAME"]
 
     # prepare dirs
+    logger.debug("dirs: MODEL_CACHE={} SESSION={} TEMP={}", MODEL_CACHE_DIR, SESSION_DIR, TEMP_DIR)
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
     session_path = SESSION_DIR / session_name
+    logger.debug("session path: {}", session_path)
 
     client = TelegramClient(str(session_path), api_id, api_hash)
     await client.connect()
+    logger.debug("telegram client connected")
 
     if not await client.is_user_authorized():
-        print(f"[{APP_NAME}] Требуется авторизация для номера {phone}")
+        logger.info("authorization required for phone {}", phone)
         await client.send_code_request(phone)
         code = input("Введите код из Telegram: ").strip()
         try:
@@ -585,21 +630,24 @@ async def main() -> None:
 
     me = await client.get_me()
     username = getattr(me, "username", None)
-    print(f"[{APP_NAME}] Вошли как: @{username}" if username else f"[{APP_NAME}] Вошли как id={me.id}")
-    print(f"[{APP_NAME}] Жду исходящие команды /tr или /transcription ...")
+    logger.info("logged in as @{}", username if username else f"id={me.id}")
+    logger.info("waiting for outgoing /tr or /transcription commands")
 
     scheduler = LowPriorityEditScheduler(client, LOW_PRIORITY_EDIT_INTERVAL_SECONDS)
+    logger.debug("low-priority edit interval: {}s", LOW_PRIORITY_EDIT_INTERVAL_SECONDS)
     model_cache = WhisperModelCache()
     asyncio.create_task(scheduler.run())
 
     @client.on(events.NewMessage(outgoing=True))
     async def handler(event: events.NewMessage.Event):
+        logger.debug("outgoing message: chat_id={} msg_id={} text={!r}", event.chat_id, event.message.id, (event.raw_text or "")[:80])
         cmd = parse_command(event.raw_text)
         if not cmd:
             return
 
         chat_id = event.chat_id
         cmd_msg_id = event.message.id
+        logger.info("command received: chat_id={} msg_id={} cmd={}", chat_id, cmd_msg_id, cmd)
 
         if not event.is_reply:
             await safe_edit_high_priority(
@@ -618,6 +666,7 @@ async def main() -> None:
 
         model_name = cmd.get("model") or DEFAULT_MODEL_NAME
         lang_force, lang_allowed = normalize_lang(cmd.get("lang"))
+        logger.debug("starting transcription task: model={} lang_force={} lang_allowed={}", model_name, lang_force, lang_allowed)
 
         # отдельная задача на обработку, чтобы не блокировать обработчик событий
         asyncio.create_task(
@@ -641,4 +690,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print(f"\n[{APP_NAME}] stopped")
+        logger.info("stopped")
