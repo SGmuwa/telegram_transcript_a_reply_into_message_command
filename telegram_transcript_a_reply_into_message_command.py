@@ -228,15 +228,18 @@ class LowPriorityEditScheduler:
         while True:
             key = await self._q.get()
             self._in_queue.discard(key)
-            text = self._pending.pop(key, None)
-            if not text:
-                continue
 
-            # глобальный rate-limit
+            # глобальный rate-limit — спим до момента, когда можно редактировать
             now = time.monotonic()
             wait = self.interval - (now - self._last_edit_at)
             if wait > 0:
                 await asyncio.sleep(wait)
+
+            # Забираем текст только после sleep: если за это время был high-priority edit,
+            # clear_for_message очистил _pending — не перезаписываем итоговое сообщение
+            text = self._pending.pop(key, None)
+            if not text:
+                continue
 
             await self._safe_edit(key[0], key[1], text)
             self._last_edit_at = time.monotonic()
@@ -378,19 +381,27 @@ async def safe_edit_high_priority(
     msg_id: int,
     text: str,
     scheduler: Optional["LowPriorityEditScheduler"] = None,
+    file: Optional[Path] = None,
 ) -> None:
     if scheduler is not None:
         scheduler.clear_for_message(chat_id, msg_id)
+    text_trimmed = text[:TELEGRAM_MAX_MESSAGE_LEN]
     try:
-        logger.debug("high_priority edit chat_id={} msg_id={}", chat_id, msg_id)
-        await client.edit_message(chat_id, msg_id, text[:TELEGRAM_MAX_MESSAGE_LEN])
+        logger.debug("high_priority edit chat_id={} msg_id={} file={}", chat_id, msg_id, file)
+        if file is not None:
+            await client.edit_message(chat_id, msg_id, text_trimmed, file=str(file))
+        else:
+            await client.edit_message(chat_id, msg_id, text_trimmed)
     except MessageNotModifiedError:
         logger.debug("high_priority edit: message not modified chat_id={} msg_id={}", chat_id, msg_id)
         return
     except FloodWaitError as e:
         logger.warning("high_priority edit: FloodWait {}s chat_id={} msg_id={}", e.seconds, chat_id, msg_id)
         await asyncio.sleep(int(e.seconds) + 1)
-        await client.edit_message(chat_id, msg_id, text[:TELEGRAM_MAX_MESSAGE_LEN])
+        if file is not None:
+            await client.edit_message(chat_id, msg_id, text_trimmed, file=str(file))
+        else:
+            await client.edit_message(chat_id, msg_id, text_trimmed)
 
 
 def format_error(err: Exception) -> str:
@@ -562,11 +573,13 @@ async def process_transcription_job(
             await safe_edit_high_priority(client, chat_id, cmd_msg_id, final_msg, scheduler=scheduler)
         else:
             logger.info("job {}: sending final message as file (message too long)", job_dir.name)
-            # Telegram не даёт «прикрепить файл» именно через edit текстового сообщения.
-            # Практически достижимый вариант: отредактировать текст и ДОПОЛНИТЕЛЬНО отправить файл reply-ем.
             txt_path.write_text(text, encoding="utf-8")
-            await safe_edit_high_priority(client, chat_id, cmd_msg_id, "🤖 Транскрипция прикреплена файлом", scheduler=scheduler)
-            await client.send_file(chat_id, str(txt_path), reply_to=cmd_msg_id)
+            await safe_edit_high_priority(
+                client, chat_id, cmd_msg_id,
+                "🤖 Транскрипция прикреплена файлом",
+                scheduler=scheduler,
+                file=txt_path,
+            )
 
     except Exception as e:
         logger.exception("job chat_id={} cmd_msg_id={} failed: {}", chat_id, cmd_msg_id, e)
