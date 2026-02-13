@@ -5,6 +5,7 @@ WORKDIR /app
 # ffmpeg + ffprobe
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    pkg-config \
   && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt

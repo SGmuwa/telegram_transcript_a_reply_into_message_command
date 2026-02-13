@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # telegram_transcript_a_reply_into_message_command.py
 import asyncio
 import os
