@@ -1,0 +1,2 @@
+telethon==1.36.0
+faster-whisper==1.0.3

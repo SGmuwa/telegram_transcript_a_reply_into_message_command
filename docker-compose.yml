@@ -1,0 +1,34 @@
+
+services:
+  telegram_transcriber:
+    build: .
+    container_name: telegram_transcript_a_reply_into_message_command
+    restart: unless-stopped
+
+    env_file:
+      - ./secrets/telegram.env
+
+    environment:
+      - TZ=Europe/Amsterdam
+      - TEMP_DIR=/tmp/telegram_transcriber
+      - MODEL_CACHE_DIR=/models
+      - SESSION_DIR=/data/session
+      - DEFAULT_MODEL_NAME=large
+      - DEFAULT_LANG=ru
+      - LOW_PRIORITY_EDIT_INTERVAL_SECONDS=120
+      - WHISPER_DEVICE=cpu
+      - WHISPER_COMPUTE_TYPE=int8
+
+    volumes:
+      - whisper_models:/models
+      - telegram_session:/data/session
+
+    tmpfs:
+      - /tmp/telegram_transcriber:size=5g,mode=1777
+
+    stdin_open: true
+    tty: true
+
+volumes:
+  whisper_models:
+  telegram_session:
