@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # telegram_transcript_a_reply_into_message_command.py
 import asyncio
+import json
 import os
 import re
 import shlex
@@ -11,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Dict, Optional, Tuple, List, Set
+from typing import Dict, Optional, Tuple, List, Set, Any
 
 from loguru import logger
 from telethon import TelegramClient, events
@@ -44,6 +45,53 @@ WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")           # cpu / cuda
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8 / float16 / int8_float16 etc.
 
 TELEGRAM_MAX_MESSAGE_LEN = 4096  # безопасно считать 4096
+
+# Файл подписок для /tr (в SESSION_DIR — переживает docker compose down/up)
+TR_SUBSCRIPTIONS_FILE = Path(os.getenv("TR_SUBSCRIPTIONS_FILE", str(SESSION_DIR / "tr_subscriptions.json"))).resolve()
+
+# Ключи подписок по типам медиа
+SUBSCRIBE_RECORD_AUDIO = "subscribe_record_audio"  # голосовые
+SUBSCRIBE_RECORD_VIDEO = "subscribe_record_video"  # видеосообщения
+SUBSCRIBE_AUDIO = "subscribe_audio"                # музыка/аудио
+SUBSCRIBE_VIDEO = "subscribe_video"               # видео
+SUBSCRIBE_KEYS = (SUBSCRIBE_RECORD_AUDIO, SUBSCRIBE_RECORD_VIDEO, SUBSCRIBE_AUDIO, SUBSCRIBE_VIDEO)
+
+
+def _parse_bool(v: Optional[str]) -> Optional[bool]:
+    if v is None:
+        return None
+    v = (v or "").strip().lower()
+    if v in ("true", "1", "yes", "on"):
+        return True
+    if v in ("false", "0", "no", "off"):
+        return False
+    return None
+
+
+def load_tr_subscriptions() -> Dict[str, Dict[str, bool]]:
+    """Загружает подписки из JSON. Ключ — str(chat_id)."""
+    if not TR_SUBSCRIPTIONS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(TR_SUBSCRIPTIONS_FILE.read_text(encoding="utf-8"))
+        chats = data.get("chats", {})
+        out = {}
+        for cid, sub in chats.items():
+            if not isinstance(sub, dict):
+                continue
+            out[str(cid)] = {k: bool(sub.get(k, False)) for k in SUBSCRIBE_KEYS}
+        return out
+    except Exception as e:
+        logger.warning("failed to load tr_subscriptions: {}", e)
+        return {}
+
+
+def save_tr_subscriptions(subscriptions: Dict[str, Dict[str, bool]]) -> None:
+    TR_SUBSCRIPTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    TR_SUBSCRIPTIONS_FILE.write_text(
+        json.dumps({"chats": subscriptions}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def now_local_str() -> str:
@@ -130,26 +178,39 @@ def parse_command(text: str) -> Optional[dict]:
     """
     /tr model=large lang=ru,en
     /transcription model=tiny lang=en
+    /tr subscribe=True help=True ...
     """
     if not text:
         return None
     t = text.strip()
-    if not (t.startswith("/tr") or t.startswith("/transcription")):
+    if not (t.startswith("/tr") or t.startswith("/transcription") or t.startswith("/ts")):
         return None
 
-    # normalize command token
     parts = shlex.split(t)
     cmd = parts[0]
-    if cmd not in ("/tr", "/transcription"):
-        # allow "/tr@botname" patterns? тут это userbot, но на всякий случай:
+    if cmd not in ("/tr", "/transcription", "/ts"):
         if cmd.startswith("/tr@"):
             cmd = "/tr"
         elif cmd.startswith("/transcription@"):
             cmd = "/transcription"
+        elif cmd.startswith("/ts@"):
+            cmd = "/ts"
         else:
             return None
 
-    args = {"cmd": cmd, "model": None, "lang": None, "tz": None}
+    args: Dict[str, Any] = {
+        "cmd": cmd,
+        "model": None,
+        "lang": None,
+        "tz": None,
+        "subscribe": None,
+        "subscribe_record_audio": None,
+        "subscribe_record_video": None,
+        "subscribe_audio": None,
+        "subscribe_video": None,
+        "destruct_message": False,
+        "help": False,
+    }
     for p in parts[1:]:
         if "=" not in p:
             continue
@@ -162,8 +223,58 @@ def parse_command(text: str) -> Optional[dict]:
             args["lang"] = v
         elif k == "tz":
             args["tz"] = v
+        elif k == "subscribe":
+            args["subscribe"] = _parse_bool(v)
+        elif k == "subscribe_record_audio":
+            args["subscribe_record_audio"] = _parse_bool(v)
+        elif k == "subscribe_record_video":
+            args["subscribe_record_video"] = _parse_bool(v)
+        elif k == "subscribe_audio":
+            args["subscribe_audio"] = _parse_bool(v)
+        elif k == "subscribe_video":
+            args["subscribe_video"] = _parse_bool(v)
+        elif k == "destruct_message":
+            args["destruct_message"] = _parse_bool(v) is True
+        elif k == "help":
+            args["help"] = _parse_bool(v) is True
     logger.debug("parsed command: {}", args)
     return args
+
+
+def _message_media_type(msg) -> Optional[str]:
+    """Тип медиа сообщения: subscribe_record_audio, subscribe_record_video, subscribe_audio, subscribe_video или None."""
+    if not getattr(msg, "media", None):
+        return None
+    if getattr(msg, "voice", None):
+        return SUBSCRIBE_RECORD_AUDIO
+    if getattr(msg, "video_note", None):
+        return SUBSCRIBE_RECORD_VIDEO
+    if getattr(msg, "audio", None):
+        return SUBSCRIBE_AUDIO
+    if getattr(msg, "video", None):
+        return SUBSCRIBE_VIDEO
+    return None
+
+
+def get_tr_help_text() -> str:
+    return """🤖 Транскрипция: /tr, /ts, /transcription — три команды, делают одно и то же.
+
+Команды (reply на медиа): /tr, /ts, /transcription
+
+Параметры (key=value):
+• model — модель Whisper (tiny, large, turbo…). По умолчанию: large
+• lang — язык (ru, en или ru,en). По умолчанию: ru
+• tz — таймзона для дат (Europe/Moscow и т.д.). По умолчанию: из env
+
+Подписки и опции (для /tr, /ts, /transcription):
+• subscribe=True — подписать чат на все типы медиа (авто /tr на каждое новое медиа)
+• subscribe=False — отписать чат
+• subscribe_record_audio=True/False — голосовые сообщения
+• subscribe_record_video=True/False — видеосообщения
+• subscribe_audio=True/False — музыка/аудио
+• subscribe_video=True/False — видео
+• destruct_message=True — не транскрибировать, удалить отправленное сообщение (удобно для подписки)
+• help=True — эта справка (без транскрипции)"""
 
 
 def normalize_lang(lang_value: Optional[str]) -> Tuple[Optional[str], Optional[List[str]]]:
@@ -756,12 +867,14 @@ async def main() -> None:
     me = await client.get_me()
     username = getattr(me, "username", None)
     logger.info("logged in as @{}", username if username else f"id={me.id}")
-    logger.info("waiting for outgoing /tr or /transcription commands")
+    logger.info("waiting for outgoing /tr, /transcription, /ts commands")
 
     scheduler = LowPriorityEditScheduler(client, LOW_PRIORITY_EDIT_INTERVAL_SECONDS)
     logger.debug("low-priority edit interval: {}s", LOW_PRIORITY_EDIT_INTERVAL_SECONDS)
     model_cache = WhisperModelCache()
     asyncio.create_task(scheduler.run())
+
+    tr_subscriptions = load_tr_subscriptions()
 
     @client.on(events.NewMessage(outgoing=True))
     async def handler(event: events.NewMessage.Event):
@@ -774,21 +887,69 @@ async def main() -> None:
         cmd_msg_id = event.message.id
         logger.info("command received: chat_id={} msg_id={} cmd={}", chat_id, cmd_msg_id, cmd)
 
-        if not event.is_reply:
+        if cmd.get("help"):
             await safe_edit_high_priority(
                 client, chat_id, cmd_msg_id,
-                "🤖 Транскрипция провалена из-за ошибки:\n```\nКоманда должна быть reply на сообщение с медиа\n```",
+                get_tr_help_text()[:TELEGRAM_MAX_MESSAGE_LEN],
                 scheduler=scheduler,
             )
+            return
+        if cmd.get("destruct_message"):
+            try:
+                await event.message.delete()
+            except Exception as e:
+                logger.warning("failed to delete message: {}", e)
+            return
+        sub = cmd.get("subscribe")
+        sub_ra = cmd.get("subscribe_record_audio")
+        sub_rv = cmd.get("subscribe_record_video")
+        sub_a = cmd.get("subscribe_audio")
+        sub_v = cmd.get("subscribe_video")
+        if sub is not None or sub_ra is not None or sub_rv is not None or sub_a is not None or sub_v is not None:
+            ckey = str(chat_id)
+            current = dict(tr_subscriptions.get(ckey, {k: False for k in SUBSCRIBE_KEYS}))
+            for k in SUBSCRIBE_KEYS:
+                if k not in current:
+                    current[k] = False
+            if sub is True:
+                for k in SUBSCRIBE_KEYS:
+                    current[k] = True
+            elif sub is False:
+                for k in SUBSCRIBE_KEYS:
+                    current[k] = False
+            if sub_ra is not None:
+                current[SUBSCRIBE_RECORD_AUDIO] = sub_ra
+            if sub_rv is not None:
+                current[SUBSCRIBE_RECORD_VIDEO] = sub_rv
+            if sub_a is not None:
+                current[SUBSCRIBE_AUDIO] = sub_a
+            if sub_v is not None:
+                current[SUBSCRIBE_VIDEO] = sub_v
+            if any(current.get(k, False) for k in SUBSCRIBE_KEYS):
+                tr_subscriptions[ckey] = current
+            else:
+                tr_subscriptions.pop(ckey, None)
+            save_tr_subscriptions(tr_subscriptions)
+            logger.debug("tr subscriptions updated for chat_id={}: {}", chat_id, current)
+
+        if not event.is_reply:
+            no_subscribe_update = (
+                cmd.get("subscribe") is None
+                and cmd.get("subscribe_record_audio") is None
+                and cmd.get("subscribe_record_video") is None
+                and cmd.get("subscribe_audio") is None
+                and cmd.get("subscribe_video") is None
+            )
+            if no_subscribe_update:
+                await safe_edit_high_priority(
+                    client, chat_id, cmd_msg_id,
+                    "🤖 Транскрипция провалена из-за ошибки:\n```\nКоманда должна быть reply на сообщение с медиа\n```",
+                    scheduler=scheduler,
+                )
             return
 
         reply_msg = await event.get_reply_message()
         if not reply_msg or not getattr(reply_msg, "media", None):
-            await safe_edit_high_priority(
-                client, chat_id, cmd_msg_id,
-                "🤖 Транскрипция провалена из-за ошибки:\n```\nReply-сообщение не содержит медиа\n```",
-                scheduler=scheduler,
-            )
             return
 
         model_name = cmd.get("model") or DEFAULT_MODEL_NAME
@@ -811,6 +972,27 @@ async def main() -> None:
                 tz_name=tz_name,
             )
         )
+
+    @client.on(events.NewMessage(incoming=True, outgoing=False))
+    async def incoming_handler(event: events.NewMessage.Event):
+        """В подписанных чатах на новое медиа автоматически отправляем /tr в ответ."""
+        chat_id = event.chat_id
+        ckey = str(chat_id)
+        if ckey not in tr_subscriptions:
+            return
+        sub = tr_subscriptions[ckey]
+        if not any(sub.get(k, False) for k in SUBSCRIBE_KEYS):
+            return
+        media_type = _message_media_type(event.message)
+        if media_type is None:
+            return
+        if not sub.get(media_type, False):
+            return
+        try:
+            await client.send_message(chat_id, "/tr", reply_to=event.message.id)
+            logger.debug("auto-sent /tr in chat_id={} for media type {}", chat_id, media_type)
+        except Exception as e:
+            logger.warning("auto /tr send failed chat_id={}: {}", chat_id, e)
 
     await client.run_until_disconnected()
 
