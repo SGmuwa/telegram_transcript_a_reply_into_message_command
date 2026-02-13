@@ -10,7 +10,7 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Set
 
 from loguru import logger
 from telethon import TelegramClient, events
@@ -175,29 +175,41 @@ class JobState:
 
 class LowPriorityEditScheduler:
     """
-    Глобальный шедулер: low-priority edit выполняется не чаще 1 раза в N секунд (глобально),
-    причём апдейты по одному сообщению дедуплицируются (в очереди всегда актуальный текст).
+    Глобальный шедулер: low-priority edit выполняется не чаще 1 раза в N секунд (глобально).
+    На одно telegram-сообщение в очереди не более одного запроса: новые обновления затирают старые.
+    После high-priority edit для сообщения очередь по этому сообщению очищается.
     """
     def __init__(self, client: TelegramClient, interval_seconds: int):
         self.client = client
         self.interval = max(1, interval_seconds)
         self._pending: Dict[Tuple[int, int], str] = {}
+        self._in_queue: Set[Tuple[int, int]] = set()  # ключи, которые уже в _q (не более 1 на сообщение)
         self._q: asyncio.Queue[Tuple[int, int]] = asyncio.Queue()
         self._last_edit_at = 0.0
         self._loop = asyncio.get_running_loop()
 
     def request(self, chat_id: int, msg_id: int, text: str) -> None:
         key = (chat_id, msg_id)
-        if key not in self._pending:
-            self._pending[key] = text
+        self._pending[key] = text
+        if key not in self._in_queue:
+            self._in_queue.add(key)
             self._q.put_nowait(key)
             logger.debug("scheduler: enqueued low-priority edit chat_id={} msg_id={}", chat_id, msg_id)
         else:
-            self._pending[key] = text
-            logger.debug("scheduler: updated pending edit chat_id={} msg_id={}", chat_id, msg_id)
+            logger.debug("scheduler: updated pending edit chat_id={} msg_id={} (already in queue)", chat_id, msg_id)
 
     def request_threadsafe(self, chat_id: int, msg_id: int, text: str) -> None:
         self._loop.call_soon_threadsafe(self.request, chat_id, msg_id, text)
+
+    def clear_for_message(self, chat_id: int, msg_id: int) -> None:
+        """Очистить очередь low-priority для данного сообщения (вызывать после high-priority edit)."""
+        key = (chat_id, msg_id)
+        self._pending.pop(key, None)
+        self._in_queue.discard(key)
+        logger.debug("scheduler: cleared queue for chat_id={} msg_id={}", chat_id, msg_id)
+
+    def clear_for_message_threadsafe(self, chat_id: int, msg_id: int) -> None:
+        self._loop.call_soon_threadsafe(self.clear_for_message, chat_id, msg_id)
 
     async def _safe_edit(self, chat_id: int, msg_id: int, text: str) -> None:
         # Telegram может ругаться на "message not modified"
@@ -215,6 +227,7 @@ class LowPriorityEditScheduler:
     async def run(self) -> None:
         while True:
             key = await self._q.get()
+            self._in_queue.discard(key)
             text = self._pending.pop(key, None)
             if not text:
                 continue
@@ -359,7 +372,15 @@ def build_progress_text(stage: str, pct: Optional[int], done_ts: Optional[str], 
     return body[:TELEGRAM_MAX_MESSAGE_LEN]
 
 
-async def safe_edit_high_priority(client: TelegramClient, chat_id: int, msg_id: int, text: str) -> None:
+async def safe_edit_high_priority(
+    client: TelegramClient,
+    chat_id: int,
+    msg_id: int,
+    text: str,
+    scheduler: Optional["LowPriorityEditScheduler"] = None,
+) -> None:
+    if scheduler is not None:
+        scheduler.clear_for_message(chat_id, msg_id)
     try:
         logger.debug("high_priority edit chat_id={} msg_id={}", chat_id, msg_id)
         await client.edit_message(chat_id, msg_id, text[:TELEGRAM_MAX_MESSAGE_LEN])
@@ -416,7 +437,8 @@ async def process_transcription_job(
         logger.debug("job {}: stage download 0%", job_dir.name)
         await safe_edit_high_priority(
             client, chat_id, cmd_msg_id,
-            build_progress_text("download", 0, None, None)
+            build_progress_text("download", 0, None, None),
+            scheduler=scheduler,
         )
 
         # --- DOWNLOAD ---
@@ -537,18 +559,18 @@ async def process_transcription_job(
 
         if len(final_msg) <= TELEGRAM_MAX_MESSAGE_LEN:
             logger.info("job {}: sending final message (inline)", job_dir.name)
-            await safe_edit_high_priority(client, chat_id, cmd_msg_id, final_msg)
+            await safe_edit_high_priority(client, chat_id, cmd_msg_id, final_msg, scheduler=scheduler)
         else:
             logger.info("job {}: sending final message as file (message too long)", job_dir.name)
             # Telegram не даёт «прикрепить файл» именно через edit текстового сообщения.
             # Практически достижимый вариант: отредактировать текст и ДОПОЛНИТЕЛЬНО отправить файл reply-ем.
             txt_path.write_text(text, encoding="utf-8")
-            await safe_edit_high_priority(client, chat_id, cmd_msg_id, "🤖 Транскрипция прикреплена файлом")
+            await safe_edit_high_priority(client, chat_id, cmd_msg_id, "🤖 Транскрипция прикреплена файлом", scheduler=scheduler)
             await client.send_file(chat_id, str(txt_path), reply_to=cmd_msg_id)
 
     except Exception as e:
         logger.exception("job chat_id={} cmd_msg_id={} failed: {}", chat_id, cmd_msg_id, e)
-        await safe_edit_high_priority(client, chat_id, cmd_msg_id, format_error(e))
+        await safe_edit_high_priority(client, chat_id, cmd_msg_id, format_error(e), scheduler=scheduler)
     finally:
         # гарантированная уборка временных файлов/директории
         try:
@@ -652,7 +674,8 @@ async def main() -> None:
         if not event.is_reply:
             await safe_edit_high_priority(
                 client, chat_id, cmd_msg_id,
-                "🤖 Транскрипция провалена из-за ошибки:\n```\nКоманда должна быть reply на сообщение с медиа\n```"
+                "🤖 Транскрипция провалена из-за ошибки:\n```\nКоманда должна быть reply на сообщение с медиа\n```",
+                scheduler=scheduler,
             )
             return
 
@@ -660,7 +683,8 @@ async def main() -> None:
         if not reply_msg or not getattr(reply_msg, "media", None):
             await safe_edit_high_priority(
                 client, chat_id, cmd_msg_id,
-                "🤖 Транскрипция провалена из-за ошибки:\n```\nReply-сообщение не содержит медиа\n```"
+                "🤖 Транскрипция провалена из-за ошибки:\n```\nReply-сообщение не содержит медиа\n```",
+                scheduler=scheduler,
             )
             return
 
