@@ -200,7 +200,7 @@ def make_transcription_message(text: str) -> Tuple[str, List]:
     # Blockquote в формате Telegram — одна entity на весь текст транскрипции
     offset = _utf16_len(prefix)
     length = _utf16_len(body)
-    entities = [MessageEntityBlockquote(offset=offset, length=length)]
+    entities = [MessageEntityBlockquote(collapsed=True, offset=offset, length=length)]
     return full_text, entities
 
 
