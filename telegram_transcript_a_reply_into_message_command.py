@@ -195,9 +195,9 @@ class LowPriorityEditScheduler:
         if key not in self._in_queue:
             self._in_queue.add(key)
             self._q.put_nowait(key)
-            logger.debug("scheduler: enqueued low-priority edit chat_id={} msg_id={}", chat_id, msg_id)
+            logger.debug("scheduler: enqueued low-priority edit chat_id={} msg_id={} text={}", chat_id, msg_id, text)
         else:
-            logger.debug("scheduler: updated pending edit chat_id={} msg_id={} (already in queue)", chat_id, msg_id)
+            logger.debug("scheduler: updated pending edit chat_id={} msg_id={} text={} (already in queue)", chat_id, msg_id, text)
 
     def request_threadsafe(self, chat_id: int, msg_id: int, text: str) -> None:
         self._loop.call_soon_threadsafe(self.request, chat_id, msg_id, text)
