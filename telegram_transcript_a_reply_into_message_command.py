@@ -184,6 +184,7 @@ class LowPriorityEditScheduler:
         self.interval = max(1, interval_seconds)
         self._pending: Dict[Tuple[int, int], str] = {}
         self._in_queue: Set[Tuple[int, int]] = set()  # ключи, которые уже в _q (не более 1 на сообщение)
+        self._cancelled: Set[Tuple[int, int]] = set()  # после high-priority edit — не применять low-priority
         self._q: asyncio.Queue[Tuple[int, int]] = asyncio.Queue()
         self._last_edit_at = 0.0
         self._loop = asyncio.get_running_loop()
@@ -202,11 +203,12 @@ class LowPriorityEditScheduler:
         self._loop.call_soon_threadsafe(self.request, chat_id, msg_id, text)
 
     def clear_for_message(self, chat_id: int, msg_id: int) -> None:
-        """Очистить очередь low-priority для данного сообщения (вызывать после high-priority edit)."""
+        """Очистить очередь low-priority для данного сообщения и пометить как отменённое (вызывать перед high-priority edit)."""
         key = (chat_id, msg_id)
         self._pending.pop(key, None)
         self._in_queue.discard(key)
-        logger.debug("scheduler: cleared queue for chat_id={} msg_id={}", chat_id, msg_id)
+        self._cancelled.add(key)
+        logger.debug("scheduler: cleared and cancelled chat_id={} msg_id={}", chat_id, msg_id)
 
     def clear_for_message_threadsafe(self, chat_id: int, msg_id: int) -> None:
         self._loop.call_soon_threadsafe(self.clear_for_message, chat_id, msg_id)
@@ -239,6 +241,12 @@ class LowPriorityEditScheduler:
             # clear_for_message очистил _pending — не перезаписываем итоговое сообщение
             text = self._pending.pop(key, None)
             if not text:
+                continue
+            # Даже если текст есть (задача могла вытащить его до clear_for_message),
+            # проверяем отмену: после high-priority edit этот ключ в _cancelled
+            if key in self._cancelled:
+                self._cancelled.discard(key)
+                logger.debug("scheduler: skip cancelled edit chat_id={} msg_id={}", key[0], key[1])
                 continue
 
             await self._safe_edit(key[0], key[1], text)
