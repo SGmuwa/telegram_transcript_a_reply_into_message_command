@@ -534,12 +534,26 @@ async def main() -> None:
     env_path = secrets_dir / "telegram.env"
     load_env_file_if_exists(env_path)
 
-    ok, missing = require_env(["TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_PHONE", "TELEGRAM_SESSION_NAME"])
+    required_secrets = ["TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_PHONE", "TELEGRAM_SESSION_NAME"]
+    ok, missing = require_env(required_secrets)
     if not ok:
-        print(f"[{APP_NAME}] Не заполнены секреты: {', '.join(missing)}")
-        print(f"[{APP_NAME}] Создан пример: {secrets_dir/'telegram.env.example'}")
-        print(f"[{APP_NAME}] Скопируйте его в {env_path} и заполните, затем перезапустите.")
-        return
+        print(f"[{APP_NAME}] Не заполнены секреты: {', '.join(missing)}", file=sys.stderr)
+        print(f"[{APP_NAME}] Введите значения через stdin (по одному на строку) или заполните {env_path}", file=sys.stderr)
+        for key in required_secrets:
+            if not os.getenv(key):
+                print(f"[{APP_NAME}] {key}: ", end="", file=sys.stderr)
+                try:
+                    value = sys.stdin.readline()
+                except (EOFError, KeyboardInterrupt):
+                    value = ""
+                if value is not None:
+                    value = value.strip()
+                if value:
+                    os.environ[key] = value
+        ok, missing = require_env(required_secrets)
+        if not ok:
+            print(f"[{APP_NAME}] Всё ещё не заполнены: {', '.join(missing)}. Выход.", file=sys.stderr)
+            return
 
     api_id = int(os.environ["TELEGRAM_API_ID"])
     api_hash = os.environ["TELEGRAM_API_HASH"]
