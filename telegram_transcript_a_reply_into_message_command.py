@@ -16,6 +16,7 @@ from typing import Dict, Optional, Tuple, List, Set
 from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.tl.functions.messages import EditMessageRequest
 from telethon.tl.types import MessageEntityBlockquote
 
 from faster_whisper import WhisperModel
@@ -435,21 +436,31 @@ async def safe_edit_high_priority(
     if scheduler is not None:
         scheduler.clear_for_message(chat_id, msg_id)
     text_trimmed = text[:TELEGRAM_MAX_MESSAGE_LEN]
-    edit_kw: dict = {}
-    if file is not None:
-        edit_kw["file"] = str(file)
-    if entities is not None:
-        edit_kw["entities"] = entities
     try:
-        logger.debug("high_priority edit chat_id={} msg_id={} file={}", chat_id, msg_id, file)
-        await client.edit_message(chat_id, msg_id, text_trimmed, **edit_kw)
+        logger.debug("high_priority edit chat_id={} msg_id={} file={} entities={}", chat_id, msg_id, file, entities is not None)
+        if entities is not None and file is None:
+            # client.edit_message() не принимает entities — используем низкоуровневый API
+            peer = await client.get_input_entity(chat_id)
+            await client(EditMessageRequest(peer=peer, id=msg_id, message=text_trimmed, entities=entities))
+        else:
+            edit_kw: dict = {}
+            if file is not None:
+                edit_kw["file"] = str(file)
+            await client.edit_message(chat_id, msg_id, text_trimmed, **edit_kw)
     except MessageNotModifiedError:
         logger.debug("high_priority edit: message not modified chat_id={} msg_id={}", chat_id, msg_id)
         return
     except FloodWaitError as e:
         logger.warning("high_priority edit: FloodWait {}s chat_id={} msg_id={}", e.seconds, chat_id, msg_id)
         await asyncio.sleep(int(e.seconds) + 1)
-        await client.edit_message(chat_id, msg_id, text_trimmed, **edit_kw)
+        if entities is not None and file is None:
+            peer = await client.get_input_entity(chat_id)
+            await client(EditMessageRequest(peer=peer, id=msg_id, message=text_trimmed, entities=entities))
+        else:
+            edit_kw = {}
+            if file is not None:
+                edit_kw["file"] = str(file)
+            await client.edit_message(chat_id, msg_id, text_trimmed, **edit_kw)
 
 
 def format_error(err: Exception) -> str:
