@@ -469,7 +469,6 @@ async def process_transcription_job(
                     pct = int(min(99, max(0, (seg.end / duration) * 100)))
                     nonlocal_state_pct = pct
                     # обновляем state из треда — thread-safe через scheduler
-                    nonlocal last_pct_local
                     if nonlocal_state_pct != last_pct_local:
                         last_pct_local = nonlocal_state_pct
                         scheduler.request_threadsafe(
