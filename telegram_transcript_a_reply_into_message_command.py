@@ -16,6 +16,7 @@ from typing import Dict, Optional, Tuple, List, Set
 from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.tl.types import MessageEntityBlockquote
 
 from faster_whisper import WhisperModel
 
@@ -180,11 +181,26 @@ def normalize_lang(lang_value: Optional[str]) -> Tuple[Optional[str], Optional[L
     return None, items
 
 
-def make_quote_block(text: str) -> str:
-    lines = text.strip().splitlines() if text else []
-    if not lines:
-        return "> "
-    return "\n".join(["> " + ln for ln in lines])
+def _utf16_len(s: str) -> int:
+    """Длина строки в единицах UTF-16 (для offset/length в Telegram API)."""
+    return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
+
+
+def make_transcription_message(text: str) -> Tuple[str, List]:
+    """
+    Текст финального сообщения с транскрипцией и entities для цитаты в формате Telegram.
+    Возвращает (plain_text, entities) для передачи в edit_message(..., entities=entities).
+    """
+    prefix = "🤖 Транскрипция:\n"
+    body = (text or "").strip()
+    if not body:
+        body = " "
+    full_text = prefix + body
+    # Blockquote в формате Telegram — одна entity на весь текст транскрипции
+    offset = _utf16_len(prefix)
+    length = _utf16_len(body)
+    entities = [MessageEntityBlockquote(offset=offset, length=length)]
+    return full_text, entities
 
 
 @dataclass
@@ -414,26 +430,26 @@ async def safe_edit_high_priority(
     text: str,
     scheduler: Optional["LowPriorityEditScheduler"] = None,
     file: Optional[Path] = None,
+    entities: Optional[List] = None,
 ) -> None:
     if scheduler is not None:
         scheduler.clear_for_message(chat_id, msg_id)
     text_trimmed = text[:TELEGRAM_MAX_MESSAGE_LEN]
+    edit_kw: dict = {}
+    if file is not None:
+        edit_kw["file"] = str(file)
+    if entities is not None:
+        edit_kw["entities"] = entities
     try:
         logger.debug("high_priority edit chat_id={} msg_id={} file={}", chat_id, msg_id, file)
-        if file is not None:
-            await client.edit_message(chat_id, msg_id, text_trimmed, file=str(file))
-        else:
-            await client.edit_message(chat_id, msg_id, text_trimmed)
+        await client.edit_message(chat_id, msg_id, text_trimmed, **edit_kw)
     except MessageNotModifiedError:
         logger.debug("high_priority edit: message not modified chat_id={} msg_id={}", chat_id, msg_id)
         return
     except FloodWaitError as e:
         logger.warning("high_priority edit: FloodWait {}s chat_id={} msg_id={}", e.seconds, chat_id, msg_id)
         await asyncio.sleep(int(e.seconds) + 1)
-        if file is not None:
-            await client.edit_message(chat_id, msg_id, text_trimmed, file=str(file))
-        else:
-            await client.edit_message(chat_id, msg_id, text_trimmed)
+        await client.edit_message(chat_id, msg_id, text_trimmed, **edit_kw)
 
 
 def format_error(err: Exception) -> str:
@@ -615,11 +631,15 @@ async def process_transcription_job(
         low_update()
 
         # --- FINAL EDIT (high priority) ---
-        final_msg = "🤖 Транскрипция:\n" + make_quote_block(text)
+        final_msg, quote_entities = make_transcription_message(text)
 
         if len(final_msg) <= TELEGRAM_MAX_MESSAGE_LEN:
             logger.info("job {}: sending final message (inline)", job_dir.name)
-            await safe_edit_high_priority(client, chat_id, cmd_msg_id, final_msg, scheduler=scheduler)
+            await safe_edit_high_priority(
+                client, chat_id, cmd_msg_id, final_msg,
+                scheduler=scheduler,
+                entities=quote_entities,
+            )
         else:
             logger.info("job {}: sending final message as file (message too long)", job_dir.name)
             txt_path.write_text(text, encoding="utf-8")
