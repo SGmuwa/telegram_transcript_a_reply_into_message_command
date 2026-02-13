@@ -1,6 +1,7 @@
 services:
   telegram_transcriber:
     build: .
+    image: telegramtranscriber
     container_name: telegram_transcript_a_reply_into_message_command
     restart: unless-stopped
 
