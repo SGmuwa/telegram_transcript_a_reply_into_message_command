@@ -718,8 +718,10 @@ async def process_transcription_job(
         logger.debug("job {}: stage download 0%", job_dir.name)
         if not is_resume:
             if not await try_high_edit(build_progress_text("download", 0, None, None)):
+                logger.debug("job {}: first edit failed, aborting", job_dir.name)
                 return
         else:
+            logger.debug("job {}: is_resume=True, skipping first high-priority edit, using low_update only", job_dir.name)
             low_update()
 
         # --- DOWNLOAD ---
@@ -867,13 +869,16 @@ async def process_transcription_job(
         if len(final_msg) <= TELEGRAM_MAX_MESSAGE_LEN:
             logger.info("job {}: sending final message (inline)", job_dir.name)
             if not await try_high_edit(final_msg, entities=quote_entities):
+                logger.debug("job {}: final edit failed, aborting without error message", job_dir.name)
                 return
         else:
             logger.info("job {}: sending final message as file (message too long)", job_dir.name)
             txt_path.write_text(text, encoding="utf-8")
             attach_msg, _ = make_transcription_message("(прикреплена файлом)", model_name)
             if not await try_high_edit(attach_msg, file=txt_path):
+                logger.debug("job {}: final edit (file) failed, aborting", job_dir.name)
                 return
+        logger.info("transcription job completed chat_id={} cmd_msg_id={} is_resume={}", chat_id, cmd_msg_id, is_resume)
 
     except Exception as e:
         logger.exception("job chat_id={} cmd_msg_id={} failed: {}", chat_id, cmd_msg_id, e)
@@ -931,12 +936,17 @@ async def process_upgrade_job(
             return False
 
     try:
+        logger.debug("upgrade job {}: downloading media", job_dir.name)
         downloaded_path = await client.download_media(reply_msg, file=str(src_path))
         if not downloaded_path:
             raise RuntimeError("Не удалось скачать медиа из reply-сообщения")
+        logger.debug("upgrade job {}: download done -> {}", job_dir.name, downloaded_path)
 
+        logger.debug("upgrade job {}: converting to wav", job_dir.name)
         await ffmpeg_convert_to_wav(Path(downloaded_path), wav_path, lambda p, n: None)
+        logger.debug("upgrade job {}: convert done", job_dir.name)
 
+        logger.debug("upgrade job {}: transcribing with model={}", job_dir.name, model_name)
         def transcribe_blocking() -> Tuple[str, dict]:
             model = model_cache.get(model_name)
             segments, info = model.transcribe(
@@ -952,18 +962,21 @@ async def process_upgrade_job(
             }
 
         text, meta = await asyncio.to_thread(transcribe_blocking)
-        logger.debug("upgrade job {}: transcribe done len={}", job_dir.name, len(text or ""))
+        logger.debug("upgrade job {}: transcribe done len={} detected_lang={}", job_dir.name, len(text or ""), meta.get("language"))
 
         if lang_allowed and meta.get("language") and meta["language"] not in lang_allowed:
             text = (text + f"\n\n[detected_language={meta['language']} not_in_allowed={','.join(lang_allowed)}]").strip()
 
         final_msg, quote_entities = make_transcription_message(text, model_name)
         if len(final_msg) <= TELEGRAM_MAX_MESSAGE_LEN:
+            logger.info("upgrade job {}: sending final message (inline) chat_id={} cmd_msg_id={}", job_dir.name, chat_id, cmd_msg_id)
             await try_high_edit(final_msg, entities=quote_entities)
         else:
+            logger.info("upgrade job {}: sending final message as file (too long) chat_id={} cmd_msg_id={}", job_dir.name, chat_id, cmd_msg_id)
             txt_path.write_text(text, encoding="utf-8")
             attach_msg, _ = make_transcription_message("(прикреплена файлом)", model_name)
             await try_high_edit(attach_msg, file=txt_path)
+        logger.info("upgrade job completed chat_id={} cmd_msg_id={}", chat_id, cmd_msg_id)
     except Exception as e:
         logger.exception("upgrade job chat_id={} cmd_msg_id={} failed: {}", chat_id, cmd_msg_id, e)
         await try_high_edit(format_error(e))
@@ -993,12 +1006,19 @@ async def startup_scan_and_resume(
     завершённые с моделью хуже DEFAULT, поставить их в очередь на дообработку/улучшение.
     Ограничение по одновременным задачам — семафор, чтобы не перегружать Telegram.
     """
+    logger.info(
+        "startup scan: starting (max_age_days={}, semaphore_limit={})",
+        RESUME_UPGRADE_MAX_AGE_DAYS,
+        RESUME_SEMAPHORE_LIMIT,
+    )
     cutoff_utc = (datetime.now().astimezone() - timedelta(days=RESUME_UPGRADE_MAX_AGE_DAYS)).astimezone(timezone.utc)
+    logger.debug("startup scan: cutoff_utc={}", cutoff_utc.isoformat())
     resume_sem = asyncio.Semaphore(RESUME_SEMAPHORE_LIMIT)
     upgrade_sem = asyncio.Semaphore(RESUME_SEMAPHORE_LIMIT)
 
     async def run_resume(chat_id: int, cmd_msg_id: int, reply_msg) -> None:
         async with resume_sem:
+            logger.debug("startup scan: run_resume started chat_id={} cmd_msg_id={}", chat_id, cmd_msg_id)
             await process_transcription_job(
                 client=client,
                 scheduler=scheduler,
@@ -1015,6 +1035,7 @@ async def startup_scan_and_resume(
 
     async def run_upgrade(chat_id: int, cmd_msg_id: int, reply_msg) -> None:
         async with upgrade_sem:
+            logger.debug("startup scan: run_upgrade started chat_id={} cmd_msg_id={}", chat_id, cmd_msg_id)
             await process_upgrade_job(
                 client=client,
                 scheduler=scheduler,
@@ -1028,9 +1049,12 @@ async def startup_scan_and_resume(
     to_upgrade: List[Tuple[int, int, Any]] = []
 
     try:
+        dialogs_scanned = 0
         async for dialog in client.iter_dialogs():
             if not getattr(dialog, "entity", None):
+                logger.debug("startup scan: skip dialog (no entity) id={}", getattr(dialog, "id", None))
                 continue
+            dialogs_scanned += 1
             try:
                 async for message in client.iter_messages(dialog.entity, from_user="me", limit=200):
                     msg_dt = message.date if message.date and message.date.tzinfo else (message.date.replace(tzinfo=timezone.utc) if message.date else None)
@@ -1048,17 +1072,33 @@ async def startup_scan_and_resume(
                     if _text_starts_with_transcription_command(text) and has_transcription:
                         if _is_unfinished_transcription_message(text):
                             to_resume.append((dialog.id, message.id, reply_id))
+                            logger.debug(
+                                "startup scan: candidate resume chat_id={} cmd_msg_id={} reply_id={}",
+                                dialog.id, message.id, reply_id,
+                            )
                         elif _is_completed_transcription_worse_than_default(text):
+                            msg_model = parse_transcription_message_model(text)
                             to_upgrade.append((dialog.id, message.id, reply_id))
+                            logger.debug(
+                                "startup scan: candidate upgrade chat_id={} cmd_msg_id={} reply_id={} (msg_model={} < default={})",
+                                dialog.id, message.id, reply_id, msg_model, DEFAULT_MODEL_NAME,
+                            )
             except Exception as e:
                 logger.warning("startup scan: error iterating dialog {}: {}", getattr(dialog, "name", dialog.id), e)
                 continue
+
+        logger.info("startup scan: dialogs_scanned={} to_resume={} to_upgrade={}", dialogs_scanned, len(to_resume), len(to_upgrade))
 
         for chat_id, cmd_msg_id, reply_id in to_resume:
             try:
                 reply_msg = await client.get_messages(chat_id, ids=reply_id)
                 if not reply_msg or not getattr(reply_msg, "media", None):
+                    logger.debug(
+                        "startup scan: skip resume chat_id={} cmd_msg_id={} (no reply or no media)",
+                        chat_id, cmd_msg_id,
+                    )
                     continue
+                logger.info("startup scan: scheduling resume chat_id={} cmd_msg_id={}", chat_id, cmd_msg_id)
                 asyncio.create_task(run_resume(chat_id, cmd_msg_id, reply_msg))
                 await asyncio.sleep(0.5)
             except Exception as e:
@@ -1068,14 +1108,18 @@ async def startup_scan_and_resume(
             try:
                 reply_msg = await client.get_messages(chat_id, ids=reply_id)
                 if not reply_msg or not getattr(reply_msg, "media", None):
+                    logger.debug(
+                        "startup scan: skip upgrade chat_id={} cmd_msg_id={} (no reply or no media)",
+                        chat_id, cmd_msg_id,
+                    )
                     continue
+                logger.info("startup scan: scheduling upgrade chat_id={} cmd_msg_id={}", chat_id, cmd_msg_id)
                 asyncio.create_task(run_upgrade(chat_id, cmd_msg_id, reply_msg))
                 await asyncio.sleep(0.5)
             except Exception as e:
                 logger.warning("startup upgrade: failed to get reply chat_id={} msg_id={}: {}", chat_id, cmd_msg_id, e)
 
-        if to_resume or to_upgrade:
-            logger.info("startup scan: found resume={} upgrade={}", len(to_resume), len(to_upgrade))
+        logger.info("startup scan: finished (resume_scheduled={} upgrade_scheduled={})", len(to_resume), len(to_upgrade))
     except Exception as e:
         logger.exception("startup_scan_and_resume failed: {}", e)
 
