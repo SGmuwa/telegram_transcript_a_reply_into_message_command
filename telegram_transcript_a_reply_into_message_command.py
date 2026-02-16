@@ -442,10 +442,17 @@ class LowPriorityEditScheduler:
     Глобальный шедулер: low-priority edit выполняется не чаще 1 раза в N секунд (глобально).
     На одно telegram-сообщение в очереди не более одного запроса: новые обновления затирают старые.
     После high-priority edit для сообщения очередь по этому сообщению очищается.
+    При передаче shutdown_event цикл run() завершается при срабатывании события (плавное выключение).
     """
-    def __init__(self, client: TelegramClient, interval_seconds: int):
+    def __init__(
+        self,
+        client: TelegramClient,
+        interval_seconds: int,
+        shutdown_event: Optional[asyncio.Event] = None,
+    ):
         self.client = client
         self.interval = max(1, interval_seconds)
+        self._shutdown_event = shutdown_event
         self._pending: Dict[Tuple[int, int], str] = {}
         self._meta: Dict[Tuple[int, int], Tuple[Optional[str], Optional[str]]] = {}  # (chat_title, msg_date_str) для логов
         self._in_queue: Set[Tuple[int, int]] = set()  # ключи, которые уже в _q (не более 1 на сообщение)
@@ -522,14 +529,39 @@ class LowPriorityEditScheduler:
 
     async def run(self) -> None:
         while True:
-            key = await self._q.get()
+            if self._shutdown_event is not None:
+                get_task = asyncio.create_task(self._q.get())
+                shutdown_task = asyncio.create_task(self._shutdown_event.wait())
+                done, pending = await asyncio.wait(
+                    [get_task, shutdown_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if shutdown_task in done:
+                    get_task.cancel()
+                    try:
+                        await get_task
+                    except asyncio.CancelledError:
+                        pass
+                    logger.debug("scheduler: shutdown requested, exiting run loop")
+                    return
+                key = get_task.result()
+            else:
+                key = await self._q.get()
             self._in_queue.discard(key)
 
             # глобальный rate-limit — спим до момента, когда можно редактировать
             now = time.monotonic()
             wait = self.interval - (now - self._last_edit_at)
             if wait > 0:
-                await asyncio.sleep(wait)
+                if self._shutdown_event is not None:
+                    try:
+                        await asyncio.wait_for(self._shutdown_event.wait(), timeout=wait)
+                        logger.debug("scheduler: shutdown requested during wait, exiting")
+                        return
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(wait)
 
             # Забираем текст только после sleep: если за это время был high-priority edit,
             # clear_for_message очистил _pending — не перезаписываем итоговое сообщение
@@ -1384,12 +1416,14 @@ async def main() -> None:
     logger.info("logged in as @{}", username if username else f"id={me.id}")
     logger.info("waiting for outgoing /tr, /transcription, /ts commands")
 
-    scheduler = LowPriorityEditScheduler(client, LOW_PRIORITY_EDIT_INTERVAL_SECONDS)
-    logger.debug("low-priority edit interval: {}s", LOW_PRIORITY_EDIT_INTERVAL_SECONDS)
-    model_cache = WhisperModelCache()
-
     shutdown_requested: List[bool] = [False]
     shutdown_event = asyncio.Event()
+
+    scheduler = LowPriorityEditScheduler(
+        client, LOW_PRIORITY_EDIT_INTERVAL_SECONDS, shutdown_event=shutdown_event
+    )
+    logger.debug("low-priority edit interval: {}s", LOW_PRIORITY_EDIT_INTERVAL_SECONDS)
+    model_cache = WhisperModelCache()
 
     def request_shutdown() -> None:
         shutdown_requested[0] = True
