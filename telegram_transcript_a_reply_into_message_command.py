@@ -284,7 +284,7 @@ def _message_media_type(msg) -> Optional[str]:
 
 
 def get_tr_help_text() -> str:
-    return """/tr, /ts, /transcription — три команды, делают одно и то же.
+    return """🤖 Помощь по командам: /tr, /ts, /transcription — три команды, делают одно и то же.
 
 Команды (reply на медиа): /tr, /ts, /transcription
 
