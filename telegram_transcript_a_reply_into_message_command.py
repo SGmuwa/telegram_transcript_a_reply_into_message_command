@@ -9,14 +9,14 @@ import sys
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Dict, Optional, Tuple, List, Set, Any
 
 from loguru import logger
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.errors import FloodWaitError, MessageEditTimeExpiredError, MessageNotModifiedError
 from telethon.tl.functions.messages import EditMessageRequest
 from telethon.tl.types import MessageEntityBlockquote
 
@@ -45,6 +45,11 @@ WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")           # cpu / cuda
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")  # int8 / float16 / int8_float16 etc.
 
 TELEGRAM_MAX_MESSAGE_LEN = 4096  # безопасно считать 4096
+
+# Порядок моделей Whisper по качеству (от худшего к лучшему)
+MODEL_ORDER = ("tiny", "base", "small", "medium", "turbo", "large")
+RESUME_UPGRADE_MAX_AGE_DAYS = 7
+RESUME_SEMAPHORE_LIMIT = 3
 
 # Файл подписок для /tr (в SESSION_DIR — переживает docker compose down/up)
 TR_SUBSCRIPTIONS_FILE = Path(os.getenv("TR_SUBSCRIPTIONS_FILE", str(SESSION_DIR / "tr_subscriptions.json"))).resolve()
@@ -298,12 +303,41 @@ def _utf16_len(s: str) -> int:
     return sum(2 if ord(c) > 0xFFFF else 1 for c in s)
 
 
-def make_transcription_message(text: str) -> Tuple[str, List]:
+def model_quality_rank(model_name: str) -> int:
+    """Индекс модели в MODEL_ORDER (0 = tiny, 5 = large). -1 для неизвестной модели."""
+    if not model_name:
+        return -1
+    name = (model_name or "").strip().lower()
+    try:
+        return MODEL_ORDER.index(name)
+    except ValueError:
+        return -1
+
+
+def parse_transcription_message_model(text: str) -> Optional[str]:
+    """
+    Извлекает имя модели из текста сообщения транскрипции.
+    Если есть «🤖 Транскрипция (model X):» — возвращает X.
+    Если только «🤖 Транскрипция:» без (model ...) — считаем small (старая версия).
+    Иначе None (не наше сообщение).
+    """
+    if not text or "🤖 Транскрипция" not in text:
+        return None
+    match = re.search(r"🤖 Транскрипция\s*\(model\s+(\w+)\)\s*:", text)
+    if match:
+        return match.group(1).strip().lower()
+    if "🤖 Транскрипция:" in text and "(model " not in text:
+        return "small"
+    return None
+
+
+def make_transcription_message(text: str, model_name: str) -> Tuple[str, List]:
     """
     Текст финального сообщения с транскрипцией и entities для цитаты в формате Telegram.
     Возвращает (plain_text, entities) для передачи в edit_message(..., entities=entities).
+    model_name обязателен и указывается в префиксе.
     """
-    prefix = "🤖 Транскрипция:\n"
+    prefix = f"🤖 Транскрипция (model {model_name}):\n"
     body = (text or "").strip()
     if not body:
         body = " "
@@ -366,7 +400,7 @@ class LowPriorityEditScheduler:
         self._loop.call_soon_threadsafe(self.clear_for_message, chat_id, msg_id)
 
     async def _safe_edit(self, chat_id: int, msg_id: int, text: str) -> None:
-        # Telegram может ругаться на "message not modified"
+        # Telegram может ругаться на "message not modified" или MessageEditTimeExpiredError
         try:
             logger.debug("scheduler: editing chat_id={} msg_id={}", chat_id, msg_id)
             await self.client.edit_message(chat_id, msg_id, text)
@@ -377,6 +411,9 @@ class LowPriorityEditScheduler:
             logger.warning("scheduler: FloodWait {}s for chat_id={} msg_id={}", e.seconds, chat_id, msg_id)
             await asyncio.sleep(int(e.seconds) + 1)
             await self.client.edit_message(chat_id, msg_id, text)
+        except Exception as e:
+            logger.warning("scheduler: edit failed chat_id={} msg_id={}: {}", chat_id, msg_id, e)
+            raise
 
     async def run(self) -> None:
         while True:
@@ -401,8 +438,12 @@ class LowPriorityEditScheduler:
                 logger.debug("scheduler: skip cancelled edit chat_id={} msg_id={}", key[0], key[1])
                 continue
 
-            await self._safe_edit(key[0], key[1], text)
-            self._last_edit_at = time.monotonic()
+            try:
+                await self._safe_edit(key[0], key[1], text)
+            except Exception as e:
+                logger.warning("scheduler: edit error, skipping message chat_id={} msg_id={}: {}", key[0], key[1], e)
+            else:
+                self._last_edit_at = time.monotonic()
 
 
 class WhisperModelCache:
@@ -572,6 +613,9 @@ async def safe_edit_high_priority(
             if file is not None:
                 edit_kw["file"] = str(file)
             await client.edit_message(chat_id, msg_id, text_trimmed, **edit_kw)
+    except Exception as e:
+        logger.warning("high_priority edit failed chat_id={} msg_id={}: {}", chat_id, msg_id, e)
+        raise
 
 
 def format_error(err: Exception) -> str:
@@ -581,6 +625,48 @@ def format_error(err: Exception) -> str:
     # чтобы не разнести лимит
     tb = tb[:2000]
     return "🤖 Транскрипция провалена из-за ошибки:\n```\n" + tb + "\n```"
+
+
+def _text_starts_with_transcription_command(text: str) -> bool:
+    """Текст начинается с /transcription, /tr или /ts (с учётом @bot)."""
+    if not text:
+        return False
+    t = text.strip()
+    return (
+        t.startswith("/transcription") or t.startswith("/tr") or t.startswith("/ts")
+        or t.startswith("/transcription@") or t.startswith("/tr@") or t.startswith("/ts@")
+    )
+
+
+def _is_unfinished_transcription_message(text: str) -> bool:
+    """Сообщение выглядит как незавершённая транскрипция (прогресс без финального результата)."""
+    if not text or "🤖 Транскрипция:" not in text:
+        return False
+    if "Скачивание медиа" in text or "Конвертация медиа" in text or "Извлечение текста" in text:
+        return True
+    if "Дата завершения: —" in text:
+        return True
+    if "%" in text and "🤖 Транскрипция:" in text:
+        return True
+    return False
+
+
+def _is_completed_transcription_worse_than_default(text: str) -> bool:
+    """Завершённое сообщение транскрипции, у которого модель хуже DEFAULT_MODEL_NAME."""
+    if not text or "🤖 Транскрипция" not in text:
+        return False
+    if "Скачивание медиа" in text or "Конвертация медиа" in text or "Извлечение текста" in text:
+        return False
+    if "Дата завершения: —" in text:
+        return False
+    msg_model = parse_transcription_message_model(text)
+    if msg_model is None:
+        return False
+    default_rank = model_quality_rank(DEFAULT_MODEL_NAME)
+    msg_rank = model_quality_rank(msg_model)
+    if default_rank < 0 or msg_rank < 0:
+        return False
+    return msg_rank < default_rank
 
 
 async def process_transcription_job(
@@ -594,12 +680,13 @@ async def process_transcription_job(
     lang_force: Optional[str],
     lang_allowed: Optional[List[str]],
     tz_name: str,
+    is_resume: bool = False,
 ) -> None:
     # temp workspace
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     job_dir = TEMP_DIR / f"job_{chat_id}_{cmd_msg_id}"
     job_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("transcription job started chat_id={} cmd_msg_id={} model={} lang_force={} lang_allowed={} tz={}", chat_id, cmd_msg_id, model_name, lang_force, lang_allowed, tz_name)
+    logger.info("transcription job started chat_id={} cmd_msg_id={} model={} is_resume={}", chat_id, cmd_msg_id, model_name, is_resume)
 
     src_path = job_dir / "source"
     wav_path = job_dir / "audio.wav"
@@ -614,14 +701,26 @@ async def process_transcription_job(
             build_progress_text(state.stage, state.pct, state.done_ts, state.note),
         )
 
+    async def try_high_edit(text: str, file: Optional[Path] = None, entities: Optional[List] = None) -> bool:
+        """Выполняет high-priority edit. При ошибке редактирования возвращает False (нужно прервать job)."""
+        try:
+            await safe_edit_high_priority(
+                client, chat_id, cmd_msg_id, text,
+                scheduler=scheduler, file=file, entities=entities,
+            )
+            return True
+        except Exception as e:
+            logger.info("message no longer editable, aborting job chat_id={} msg_id={}: {}", chat_id, cmd_msg_id, e)
+            return False
+
     try:
-        # 9) high priority: старт скачивания
+        # high priority: старт скачивания (для resume не делаем первый edit, только low_update при прогрессе)
         logger.debug("job {}: stage download 0%", job_dir.name)
-        await safe_edit_high_priority(
-            client, chat_id, cmd_msg_id,
-            build_progress_text("download", 0, None, None),
-            scheduler=scheduler,
-        )
+        if not is_resume:
+            if not await try_high_edit(build_progress_text("download", 0, None, None)):
+                return
+        else:
+            low_update()
 
         # --- DOWNLOAD ---
         total = getattr(getattr(reply_msg, "file", None), "size", None)
@@ -763,28 +862,22 @@ async def process_transcription_job(
         low_update()
 
         # --- FINAL EDIT (high priority) ---
-        final_msg, quote_entities = make_transcription_message(text)
+        final_msg, quote_entities = make_transcription_message(text, model_name)
 
         if len(final_msg) <= TELEGRAM_MAX_MESSAGE_LEN:
             logger.info("job {}: sending final message (inline)", job_dir.name)
-            await safe_edit_high_priority(
-                client, chat_id, cmd_msg_id, final_msg,
-                scheduler=scheduler,
-                entities=quote_entities,
-            )
+            if not await try_high_edit(final_msg, entities=quote_entities):
+                return
         else:
             logger.info("job {}: sending final message as file (message too long)", job_dir.name)
             txt_path.write_text(text, encoding="utf-8")
-            await safe_edit_high_priority(
-                client, chat_id, cmd_msg_id,
-                "🤖 Транскрипция прикреплена файлом",
-                scheduler=scheduler,
-                file=txt_path,
-            )
+            attach_msg, _ = make_transcription_message("(прикреплена файлом)", model_name)
+            if not await try_high_edit(attach_msg, file=txt_path):
+                return
 
     except Exception as e:
         logger.exception("job chat_id={} cmd_msg_id={} failed: {}", chat_id, cmd_msg_id, e)
-        await safe_edit_high_priority(client, chat_id, cmd_msg_id, format_error(e), scheduler=scheduler)
+        await try_high_edit(format_error(e))
     finally:
         # гарантированная уборка временных файлов/директории
         try:
@@ -800,6 +893,191 @@ async def process_transcription_job(
         except Exception:
             pass
         logger.debug("job {}: temp dir removed", job_dir.name)
+
+
+async def process_upgrade_job(
+    client: TelegramClient,
+    scheduler: LowPriorityEditScheduler,
+    model_cache: WhisperModelCache,
+    chat_id: int,
+    cmd_msg_id: int,
+    reply_msg,
+) -> None:
+    """
+    Улучшение качества: скачать медиа из reply, конвертировать, транскрибировать DEFAULT моделью.
+    Редактировать сообщение только один раз в конце готовым результатом (без промежуточных правок).
+    """
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    job_dir = TEMP_DIR / f"upgrade_{chat_id}_{cmd_msg_id}"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("upgrade job started chat_id={} cmd_msg_id={}", chat_id, cmd_msg_id)
+
+    src_path = job_dir / "source"
+    wav_path = job_dir / "audio.wav"
+    txt_path = job_dir / "transcription.txt"
+    model_name = DEFAULT_MODEL_NAME
+    lang_force, lang_allowed = normalize_lang(DEFAULT_LANG)
+    tz_name = DEFAULT_TZ
+
+    async def try_high_edit(text: str, file: Optional[Path] = None, entities: Optional[List] = None) -> bool:
+        try:
+            await safe_edit_high_priority(
+                client, chat_id, cmd_msg_id, text,
+                scheduler=scheduler, file=file, entities=entities,
+            )
+            return True
+        except Exception as e:
+            logger.info("message no longer editable, aborting upgrade job chat_id={} msg_id={}: {}", chat_id, cmd_msg_id, e)
+            return False
+
+    try:
+        downloaded_path = await client.download_media(reply_msg, file=str(src_path))
+        if not downloaded_path:
+            raise RuntimeError("Не удалось скачать медиа из reply-сообщения")
+
+        await ffmpeg_convert_to_wav(Path(downloaded_path), wav_path, lambda p, n: None)
+
+        def transcribe_blocking() -> Tuple[str, dict]:
+            model = model_cache.get(model_name)
+            segments, info = model.transcribe(
+                str(wav_path),
+                language=lang_force,
+                task="transcribe",
+                vad_filter=True,
+            )
+            out_chunks = [seg.text for seg in segments]
+            return "".join(out_chunks).strip(), {
+                "language": getattr(info, "language", None),
+                "language_probability": getattr(info, "language_probability", None),
+            }
+
+        text, meta = await asyncio.to_thread(transcribe_blocking)
+        logger.debug("upgrade job {}: transcribe done len={}", job_dir.name, len(text or ""))
+
+        if lang_allowed and meta.get("language") and meta["language"] not in lang_allowed:
+            text = (text + f"\n\n[detected_language={meta['language']} not_in_allowed={','.join(lang_allowed)}]").strip()
+
+        final_msg, quote_entities = make_transcription_message(text, model_name)
+        if len(final_msg) <= TELEGRAM_MAX_MESSAGE_LEN:
+            await try_high_edit(final_msg, entities=quote_entities)
+        else:
+            txt_path.write_text(text, encoding="utf-8")
+            attach_msg, _ = make_transcription_message("(прикреплена файлом)", model_name)
+            await try_high_edit(attach_msg, file=txt_path)
+    except Exception as e:
+        logger.exception("upgrade job chat_id={} cmd_msg_id={} failed: {}", chat_id, cmd_msg_id, e)
+        await try_high_edit(format_error(e))
+    finally:
+        try:
+            for p in job_dir.rglob("*"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            try:
+                job_dir.rmdir()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        logger.debug("upgrade job {}: temp dir removed", job_dir.name)
+
+
+async def startup_scan_and_resume(
+    client: TelegramClient,
+    scheduler: LowPriorityEditScheduler,
+    model_cache: WhisperModelCache,
+) -> None:
+    """
+    Фоновая задача при старте: найти за последние 7 дней незавершённые транскрипции и
+    завершённые с моделью хуже DEFAULT, поставить их в очередь на дообработку/улучшение.
+    Ограничение по одновременным задачам — семафор, чтобы не перегружать Telegram.
+    """
+    cutoff_utc = (datetime.now().astimezone() - timedelta(days=RESUME_UPGRADE_MAX_AGE_DAYS)).astimezone(timezone.utc)
+    resume_sem = asyncio.Semaphore(RESUME_SEMAPHORE_LIMIT)
+    upgrade_sem = asyncio.Semaphore(RESUME_SEMAPHORE_LIMIT)
+
+    async def run_resume(chat_id: int, cmd_msg_id: int, reply_msg) -> None:
+        async with resume_sem:
+            await process_transcription_job(
+                client=client,
+                scheduler=scheduler,
+                model_cache=model_cache,
+                chat_id=chat_id,
+                cmd_msg_id=cmd_msg_id,
+                reply_msg=reply_msg,
+                model_name=DEFAULT_MODEL_NAME,
+                lang_force=normalize_lang(DEFAULT_LANG)[0],
+                lang_allowed=normalize_lang(DEFAULT_LANG)[1],
+                tz_name=DEFAULT_TZ,
+                is_resume=True,
+            )
+
+    async def run_upgrade(chat_id: int, cmd_msg_id: int, reply_msg) -> None:
+        async with upgrade_sem:
+            await process_upgrade_job(
+                client=client,
+                scheduler=scheduler,
+                model_cache=model_cache,
+                chat_id=chat_id,
+                cmd_msg_id=cmd_msg_id,
+                reply_msg=reply_msg,
+            )
+
+    to_resume: List[Tuple[int, int, Any]] = []
+    to_upgrade: List[Tuple[int, int, Any]] = []
+
+    try:
+        async for dialog in client.iter_dialogs():
+            if not getattr(dialog, "entity", None):
+                continue
+            try:
+                async for message in client.iter_messages(dialog.entity, from_user="me", limit=200):
+                    msg_dt = message.date if message.date and message.date.tzinfo else (message.date.replace(tzinfo=timezone.utc) if message.date else None)
+                    if not msg_dt or msg_dt < cutoff_utc:
+                        break
+                    if not getattr(message, "out", True):
+                        continue
+                    text = (message.text or message.message or "") if hasattr(message, "text") else (getattr(message, "message", "") or "")
+                    if not text.strip():
+                        continue
+                    reply_id = getattr(message, "reply_to_msg_id", None)
+                    if not reply_id:
+                        continue
+                    has_transcription = "🤖 Транскрипция:" in text or "🤖 Транскрипция (model" in text
+                    if _text_starts_with_transcription_command(text) and has_transcription:
+                        if _is_unfinished_transcription_message(text):
+                            to_resume.append((dialog.id, message.id, reply_id))
+                        elif _is_completed_transcription_worse_than_default(text):
+                            to_upgrade.append((dialog.id, message.id, reply_id))
+            except Exception as e:
+                logger.warning("startup scan: error iterating dialog {}: {}", getattr(dialog, "name", dialog.id), e)
+                continue
+
+        for chat_id, cmd_msg_id, reply_id in to_resume:
+            try:
+                reply_msg = await client.get_messages(chat_id, ids=reply_id)
+                if not reply_msg or not getattr(reply_msg, "media", None):
+                    continue
+                asyncio.create_task(run_resume(chat_id, cmd_msg_id, reply_msg))
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning("startup resume: failed to get reply chat_id={} msg_id={}: {}", chat_id, cmd_msg_id, e)
+
+        for chat_id, cmd_msg_id, reply_id in to_upgrade:
+            try:
+                reply_msg = await client.get_messages(chat_id, ids=reply_id)
+                if not reply_msg or not getattr(reply_msg, "media", None):
+                    continue
+                asyncio.create_task(run_upgrade(chat_id, cmd_msg_id, reply_msg))
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning("startup upgrade: failed to get reply chat_id={} msg_id={}: {}", chat_id, cmd_msg_id, e)
+
+        if to_resume or to_upgrade:
+            logger.info("startup scan: found resume={} upgrade={}", len(to_resume), len(to_upgrade))
+    except Exception as e:
+        logger.exception("startup_scan_and_resume failed: {}", e)
 
 
 async def main() -> None:
@@ -873,6 +1151,7 @@ async def main() -> None:
     logger.debug("low-priority edit interval: {}s", LOW_PRIORITY_EDIT_INTERVAL_SECONDS)
     model_cache = WhisperModelCache()
     asyncio.create_task(scheduler.run())
+    asyncio.create_task(startup_scan_and_resume(client, scheduler, model_cache))
 
     tr_subscriptions = load_tr_subscriptions()
 
