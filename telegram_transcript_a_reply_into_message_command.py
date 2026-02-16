@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import sys
 import time
 import traceback
@@ -35,6 +36,7 @@ DEFAULT_MODEL_NAME = os.getenv("DEFAULT_MODEL_NAME", "large")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ru")
 TZ = os.getenv("TZ", "Europe/Moscow")
 LOW_PRIORITY_EDIT_INTERVAL_SECONDS = int(os.getenv("LOW_PRIORITY_EDIT_INTERVAL_SECONDS", "120"))
+STOP_GRACE_PERIOD_SECONDS = int(os.getenv("STOP_GRACE_PERIOD", "3600"))  # 1 час — ожидание завершения задач при Ctrl+C
 
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "./.tmp")).resolve()
 MODEL_CACHE_DIR = Path(os.getenv("MODEL_CACHE_DIR", "./.models")).resolve()
@@ -1157,12 +1159,15 @@ async def startup_scan_and_resume(
     client: TelegramClient,
     scheduler: LowPriorityEditScheduler,
     model_cache: WhisperModelCache,
+    shutdown_requested: Optional[List[bool]] = None,
 ) -> None:
     """
     Фоновая задача при старте: найти за последние 7 дней незавершённые транскрипции и
     завершённые с моделью хуже DEFAULT, поставить их в очередь на дообработку/улучшение.
     Ограничение по одновременным задачам — семафор, чтобы не перегружать Telegram.
     """
+    if shutdown_requested and shutdown_requested[0]:
+        return
     logger.info(
         "startup scan: starting (max_age_days={}, semaphore_limit={})",
         RESUME_UPGRADE_MAX_AGE_DAYS,
@@ -1376,13 +1381,32 @@ async def main() -> None:
     scheduler = LowPriorityEditScheduler(client, LOW_PRIORITY_EDIT_INTERVAL_SECONDS)
     logger.debug("low-priority edit interval: {}s", LOW_PRIORITY_EDIT_INTERVAL_SECONDS)
     model_cache = WhisperModelCache()
+
+    shutdown_requested: List[bool] = [False]
+    shutdown_event = asyncio.Event()
+
+    def request_shutdown() -> None:
+        shutdown_requested[0] = True
+        shutdown_event.set()
+        logger.info("shutdown requested, grace_period={}s (no new messages will be processed)", STOP_GRACE_PERIOD_SECONDS)
+
+    loop = asyncio.get_running_loop()
+    try:
+        loop.add_signal_handler(signal.SIGINT, request_shutdown)
+        loop.add_signal_handler(signal.SIGTERM, request_shutdown)
+    except NotImplementedError:
+        signal.signal(signal.SIGINT, lambda s, f: loop.call_soon_threadsafe(request_shutdown))
+        signal.signal(signal.SIGTERM, lambda s, f: loop.call_soon_threadsafe(request_shutdown))
+
     asyncio.create_task(scheduler.run())
-    asyncio.create_task(startup_scan_and_resume(client, scheduler, model_cache))
+    asyncio.create_task(startup_scan_and_resume(client, scheduler, model_cache, shutdown_requested))
 
     tr_subscriptions = load_tr_subscriptions()
 
     @client.on(events.NewMessage(outgoing=True))
     async def handler(event: events.NewMessage.Event):
+        if shutdown_requested[0]:
+            return
         chat_title = _chat_display_name(event.chat)
         msg_date_str = _msg_date_str(getattr(event.message, "date", None))
         logger.debug(
@@ -1484,6 +1508,9 @@ async def main() -> None:
                 )
             return
 
+        if shutdown_requested[0]:
+            return
+
         reply_msg = await event.get_reply_message()
         if not reply_msg or not getattr(reply_msg, "media", None):
             return
@@ -1514,6 +1541,8 @@ async def main() -> None:
     @client.on(events.NewMessage(incoming=True, outgoing=False))
     async def incoming_handler(event: events.NewMessage.Event):
         """В подписанных чатах на новое медиа отправляем сообщение с прогрессом и запускаем транскрипцию (без команды /tr)."""
+        if shutdown_requested[0]:
+            return
         chat_id = event.chat_id
         chat_title = _chat_display_name(event.chat)
         ckey = str(chat_id)
@@ -1559,11 +1588,32 @@ async def main() -> None:
         except Exception as e:
             logger.warning("subscription: send or start job failed chat_id={} chat={}: {}", chat_id, chat_title, e)
 
-    await client.run_until_disconnected()
+    async def wait_shutdown_then_disconnect() -> None:
+        await shutdown_event.wait()
+        logger.info("disconnecting client...")
+        await client.disconnect()
+
+    await asyncio.gather(
+        client.run_until_disconnected(),
+        wait_shutdown_then_disconnect(),
+    )
+
+    loop = asyncio.get_running_loop()
+    current = asyncio.current_task()
+    tasks = [t for t in asyncio.all_tasks(loop) if t is not current and not t.done()]
+    if tasks:
+        logger.info("waiting up to {}s for {} task(s) to finish...", STOP_GRACE_PERIOD_SECONDS, len(tasks))
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=STOP_GRACE_PERIOD_SECONDS)
+            if pending:
+                logger.info("cancelling {} task(s) after grace period", len(pending))
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+        except Exception as e:
+            logger.warning("graceful wait error: {}", e)
+    logger.info("stopped")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("stopped")
+    asyncio.run(main())
