@@ -548,7 +548,7 @@ async def safe_edit_high_priority(
         scheduler.clear_for_message(chat_id, msg_id)
     text_trimmed = text[:TELEGRAM_MAX_MESSAGE_LEN]
     try:
-        logger.debug("high_priority edit chat_id={} msg_id={} file={} entities={}", chat_id, msg_id, file, entities is not None)
+        logger.debug("high_priority edit chat_id={} msg_id={} file={} entities={}, text={}", chat_id, msg_id, file, entities is not None, text)
         if entities is not None and file is None:
             # client.edit_message() не принимает entities — используем низкоуровневый API
             peer = await client.get_input_entity(chat_id)
