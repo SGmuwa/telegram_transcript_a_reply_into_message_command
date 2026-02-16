@@ -36,7 +36,7 @@ DEFAULT_MODEL_NAME = os.getenv("DEFAULT_MODEL_NAME", "large")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ru")
 TZ = os.getenv("TZ", "Europe/Moscow")
 LOW_PRIORITY_EDIT_INTERVAL_SECONDS = int(os.getenv("LOW_PRIORITY_EDIT_INTERVAL_SECONDS", "120"))
-STOP_GRACE_PERIOD_SECONDS = int(os.getenv("STOP_GRACE_PERIOD", "3600"))  # 1 час — ожидание завершения задач при Ctrl+C
+STOP_GRACE_PERIOD_SECONDS = int(os.getenv("STOP_GRACE_PERIOD", "3500"))  # ~ 1 час — ожидание завершения задач при Ctrl+C
 
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "./.tmp")).resolve()
 MODEL_CACHE_DIR = Path(os.getenv("MODEL_CACHE_DIR", "./.models")).resolve()
@@ -1277,7 +1277,10 @@ async def startup_scan_and_resume(
                     "startup scan: scheduling resume chat_id={} chat={} cmd_msg_id={} cmd_msg_date={}",
                     chat_id, chat_title, cmd_msg_id, _msg_date_str(cmd_msg_date),
                 )
-                asyncio.create_task(run_resume(chat_id, cmd_msg_id, reply_msg, chat_title, cmd_msg_date))
+                asyncio.create_task(
+                    run_resume(chat_id, cmd_msg_id, reply_msg, chat_title, cmd_msg_date),
+                    name=f"resume_{chat_id}_{cmd_msg_id}",
+                )
                 await asyncio.sleep(0.5)
             except Exception as e:
                 logger.warning(
@@ -1298,7 +1301,10 @@ async def startup_scan_and_resume(
                     "startup scan: scheduling upgrade chat_id={} chat={} cmd_msg_id={} cmd_msg_date={}",
                     chat_id, chat_title, cmd_msg_id, _msg_date_str(cmd_msg_date),
                 )
-                asyncio.create_task(run_upgrade(chat_id, cmd_msg_id, reply_msg, chat_title, cmd_msg_date))
+                asyncio.create_task(
+                    run_upgrade(chat_id, cmd_msg_id, reply_msg, chat_title, cmd_msg_date),
+                    name=f"upgrade_{chat_id}_{cmd_msg_id}",
+                )
                 await asyncio.sleep(0.5)
             except Exception as e:
                 logger.warning(
@@ -1398,8 +1404,8 @@ async def main() -> None:
         signal.signal(signal.SIGINT, lambda s, f: loop.call_soon_threadsafe(request_shutdown))
         signal.signal(signal.SIGTERM, lambda s, f: loop.call_soon_threadsafe(request_shutdown))
 
-    asyncio.create_task(scheduler.run())
-    asyncio.create_task(startup_scan_and_resume(client, scheduler, model_cache, shutdown_requested))
+    asyncio.create_task(scheduler.run(), name="scheduler")
+    asyncio.create_task(startup_scan_and_resume(client, scheduler, model_cache, shutdown_requested), name="startup_scan")
 
     tr_subscriptions = load_tr_subscriptions()
 
@@ -1535,7 +1541,8 @@ async def main() -> None:
                 tz_name=tz_name,
                 chat_title=chat_title,
                 cmd_msg_date=cmd_msg_date,
-            )
+            ),
+            name=f"transcription_{chat_id}_{cmd_msg_id}",
         )
 
     @client.on(events.NewMessage(incoming=True, outgoing=False))
@@ -1583,7 +1590,8 @@ async def main() -> None:
                     is_resume=False,
                     chat_title=chat_title,
                     cmd_msg_date=getattr(sent_msg, "date", None),
-                )
+                ),
+                name=f"subscription_transcription_{chat_id}_{sent_msg.id}",
             )
         except Exception as e:
             logger.warning("subscription: send or start job failed chat_id={} chat={}: {}", chat_id, chat_title, e)
@@ -1602,11 +1610,23 @@ async def main() -> None:
     current = asyncio.current_task()
     tasks = [t for t in asyncio.all_tasks(loop) if t is not current and not t.done()]
     if tasks:
-        logger.info("waiting up to {}s for {} task(s) to finish...", STOP_GRACE_PERIOD_SECONDS, len(tasks))
+        def _task_label(task: asyncio.Task) -> str:
+            if hasattr(task, "get_name"):
+                name = task.get_name()
+                if name:
+                    return name
+            return repr(task.get_coro())
+        task_names = [_task_label(t) for t in tasks]
+        names_str = ", ".join(str(n) for n in task_names)
+        logger.info(
+            "waiting up to {}s for {} task(s) to finish: {}",
+            STOP_GRACE_PERIOD_SECONDS, len(tasks), names_str,
+        )
         try:
             done, pending = await asyncio.wait(tasks, timeout=STOP_GRACE_PERIOD_SECONDS)
             if pending:
-                logger.info("cancelling {} task(s) after grace period", len(pending))
+                pending_names = [_task_label(t) for t in pending]
+                logger.info("cancelling {} task(s) after grace period: {}", len(pending), ", ".join(pending_names))
                 for t in pending:
                     t.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
