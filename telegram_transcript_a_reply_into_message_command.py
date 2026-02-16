@@ -1490,7 +1490,7 @@ async def main() -> None:
 
     @client.on(events.NewMessage(incoming=True, outgoing=False))
     async def incoming_handler(event: events.NewMessage.Event):
-        """В подписанных чатах на новое медиа автоматически отправляем /tr в ответ."""
+        """В подписанных чатах на новое медиа отправляем сообщение с прогрессом и запускаем транскрипцию (без команды /tr)."""
         chat_id = event.chat_id
         chat_title = _chat_display_name(event.chat)
         ckey = str(chat_id)
@@ -1505,10 +1505,36 @@ async def main() -> None:
         if not sub.get(media_type, False):
             return
         try:
-            await client.send_message(chat_id, "/tr", reply_to=event.message.id, silent=True)
-            logger.debug("auto-sent /tr in chat_id={} chat={} for media type {}", chat_id, chat_title, media_type)
+            initial_text = build_progress_text("download", 0, None, None)
+            sent_msg = await client.send_message(
+                chat_id,
+                initial_text,
+                reply_to=event.message.id,
+                silent=True,
+            )
+            logger.debug(
+                "subscription: sent progress message chat_id={} chat={} cmd_msg_id={} media_type={}",
+                chat_id, chat_title, sent_msg.id, media_type,
+            )
+            asyncio.create_task(
+                process_transcription_job(
+                    client=client,
+                    scheduler=scheduler,
+                    model_cache=model_cache,
+                    chat_id=chat_id,
+                    cmd_msg_id=sent_msg.id,
+                    reply_msg=event.message,
+                    model_name=DEFAULT_MODEL_NAME,
+                    lang_force=normalize_lang(DEFAULT_LANG)[0],
+                    lang_allowed=normalize_lang(DEFAULT_LANG)[1],
+                    tz_name=TZ,
+                    is_resume=False,
+                    chat_title=chat_title,
+                    cmd_msg_date=getattr(sent_msg, "date", None),
+                )
+            )
         except Exception as e:
-            logger.warning("auto /tr send failed chat_id={} chat={}: {}", chat_id, chat_title, e)
+            logger.warning("subscription: send or start job failed chat_id={} chat={}: {}", chat_id, chat_title, e)
 
     await client.run_until_disconnected()
 
