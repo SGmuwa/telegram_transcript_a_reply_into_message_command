@@ -391,50 +391,77 @@ class LowPriorityEditScheduler:
         self.client = client
         self.interval = max(1, interval_seconds)
         self._pending: Dict[Tuple[int, int], str] = {}
+        self._meta: Dict[Tuple[int, int], Tuple[Optional[str], Optional[str]]] = {}  # (chat_title, msg_date_str) для логов
         self._in_queue: Set[Tuple[int, int]] = set()  # ключи, которые уже в _q (не более 1 на сообщение)
         self._cancelled: Set[Tuple[int, int]] = set()  # после high-priority edit — не применять low-priority
         self._q: asyncio.Queue[Tuple[int, int]] = asyncio.Queue()
         self._last_edit_at = 0.0
         self._loop = asyncio.get_running_loop()
 
-    def request(self, chat_id: int, msg_id: int, text: str) -> None:
+    def request(
+        self,
+        chat_id: int,
+        msg_id: int,
+        text: str,
+        chat_title: Optional[str] = None,
+        msg_date_str: Optional[str] = None,
+    ) -> None:
         key = (chat_id, msg_id)
         self._pending[key] = text
+        self._meta[key] = (chat_title, msg_date_str)
+        chat_label = chat_title or str(chat_id)
+        date_label = msg_date_str if msg_date_str is not None else "—"
         if key not in self._in_queue:
             self._in_queue.add(key)
             self._q.put_nowait(key)
-            logger.debug("scheduler: enqueued low-priority edit chat_id={} msg_id={} text={}", chat_id, msg_id, text)
+            logger.debug(
+                "scheduler: enqueued low-priority edit chat_id={} chat={} msg_id={} msg_date={} text={}",
+                chat_id, chat_label, msg_id, date_label, text,
+            )
         else:
-            logger.debug("scheduler: updated pending edit chat_id={} msg_id={} text={} (already in queue)", chat_id, msg_id, text)
+            logger.debug(
+                "scheduler: updated pending edit chat_id={} chat={} msg_id={} msg_date={} text={} (already in queue)",
+                chat_id, chat_label, msg_id, date_label, text,
+            )
 
-    def request_threadsafe(self, chat_id: int, msg_id: int, text: str) -> None:
-        self._loop.call_soon_threadsafe(self.request, chat_id, msg_id, text)
+    def request_threadsafe(
+        self,
+        chat_id: int,
+        msg_id: int,
+        text: str,
+        chat_title: Optional[str] = None,
+        msg_date_str: Optional[str] = None,
+    ) -> None:
+        self._loop.call_soon_threadsafe(self.request, chat_id, msg_id, text, chat_title, msg_date_str)
 
     def clear_for_message(self, chat_id: int, msg_id: int) -> None:
         """Очистить очередь low-priority для данного сообщения и пометить как отменённое (вызывать перед high-priority edit)."""
         key = (chat_id, msg_id)
         self._pending.pop(key, None)
+        chat_title, msg_date_str = self._meta.pop(key, (None, None))
         self._in_queue.discard(key)
         self._cancelled.add(key)
-        logger.debug("scheduler: cleared and cancelled chat_id={} msg_id={}", chat_id, msg_id)
+        chat_label = chat_title or str(chat_id)
+        date_label = msg_date_str if msg_date_str is not None else "—"
+        logger.debug("scheduler: cleared and cancelled chat_id={} chat={} msg_id={} msg_date={}", chat_id, chat_label, msg_id, date_label)
 
     def clear_for_message_threadsafe(self, chat_id: int, msg_id: int) -> None:
         self._loop.call_soon_threadsafe(self.clear_for_message, chat_id, msg_id)
 
-    async def _safe_edit(self, chat_id: int, msg_id: int, text: str) -> None:
+    async def _safe_edit(self, chat_id: int, msg_id: int, text: str, chat_label: str = "", date_label: str = "—") -> None:
         # Telegram может ругаться на "message not modified" или MessageEditTimeExpiredError
         try:
-            logger.debug("scheduler: editing chat_id={} msg_id={}", chat_id, msg_id)
+            logger.debug("scheduler: editing chat_id={} chat={} msg_id={} msg_date={}", chat_id, chat_label or chat_id, msg_id, date_label)
             await self.client.edit_message(chat_id, msg_id, text)
         except MessageNotModifiedError:
-            logger.debug("scheduler: message not modified chat_id={} msg_id={}", chat_id, msg_id)
+            logger.debug("scheduler: message not modified chat_id={} chat={} msg_id={} msg_date={}", chat_id, chat_label or chat_id, msg_id, date_label)
             return
         except FloodWaitError as e:
-            logger.warning("scheduler: FloodWait {}s for chat_id={} msg_id={}", e.seconds, chat_id, msg_id)
+            logger.warning("scheduler: FloodWait {}s for chat_id={} chat={} msg_id={} msg_date={}", e.seconds, chat_id, chat_label or chat_id, msg_id, date_label)
             await asyncio.sleep(int(e.seconds) + 1)
             await self.client.edit_message(chat_id, msg_id, text)
         except Exception as e:
-            logger.warning("scheduler: edit failed chat_id={} msg_id={}: {}", chat_id, msg_id, e)
+            logger.warning("scheduler: edit failed chat_id={} chat={} msg_id={} msg_date={}: {}", chat_id, chat_label or chat_id, msg_id, date_label, e)
             raise
 
     async def run(self) -> None:
@@ -457,13 +484,19 @@ class LowPriorityEditScheduler:
             # проверяем отмену: после high-priority edit этот ключ в _cancelled
             if key in self._cancelled:
                 self._cancelled.discard(key)
-                logger.debug("scheduler: skip cancelled edit chat_id={} msg_id={}", key[0], key[1])
+                chat_title, msg_date_str = self._meta.pop(key, (None, None))
+                chat_label = chat_title or str(key[0])
+                date_label = msg_date_str if msg_date_str is not None else "—"
+                logger.debug("scheduler: skip cancelled edit chat_id={} chat={} msg_id={} msg_date={}", key[0], chat_label, key[1], date_label)
                 continue
 
+            chat_title, msg_date_str = self._meta.pop(key, (None, None))
+            chat_label = chat_title or str(key[0])
+            date_label = msg_date_str if msg_date_str is not None else "—"
             try:
-                await self._safe_edit(key[0], key[1], text)
+                await self._safe_edit(key[0], key[1], text, chat_label, date_label)
             except Exception as e:
-                logger.warning("scheduler: edit error, skipping message chat_id={} msg_id={}: {}", key[0], key[1], e)
+                logger.warning("scheduler: edit error, skipping message chat_id={} chat={} msg_id={} msg_date={}: {}", key[0], chat_label, key[1], date_label, e)
             else:
                 self._last_edit_at = time.monotonic()
 
@@ -606,12 +639,19 @@ async def safe_edit_high_priority(
     scheduler: Optional["LowPriorityEditScheduler"] = None,
     file: Optional[Path] = None,
     entities: Optional[List] = None,
+    chat_title: Optional[str] = None,
+    msg_date_str: Optional[str] = None,
 ) -> None:
+    chat_label = chat_title or str(chat_id)
+    date_label = msg_date_str if msg_date_str is not None else "—"
     if scheduler is not None:
         scheduler.clear_for_message(chat_id, msg_id)
     text_trimmed = text[:TELEGRAM_MAX_MESSAGE_LEN]
     try:
-        logger.debug("high_priority edit chat_id={} msg_id={} file={} entities={}, text={}", chat_id, msg_id, file, entities is not None, text)
+        logger.debug(
+            "high_priority edit chat_id={} chat={} msg_id={} msg_date={} file={} entities={}, text={}",
+            chat_id, chat_label, msg_id, date_label, file, entities is not None, text,
+        )
         if entities is not None and file is None:
             # client.edit_message() не принимает entities — используем низкоуровневый API
             peer = await client.get_input_entity(chat_id)
@@ -622,10 +662,10 @@ async def safe_edit_high_priority(
                 edit_kw["file"] = str(file)
             await client.edit_message(chat_id, msg_id, text_trimmed, **edit_kw)
     except MessageNotModifiedError:
-        logger.debug("high_priority edit: message not modified chat_id={} msg_id={}", chat_id, msg_id)
+        logger.debug("high_priority edit: message not modified chat_id={} chat={} msg_id={} msg_date={}", chat_id, chat_label, msg_id, date_label)
         return
     except FloodWaitError as e:
-        logger.warning("high_priority edit: FloodWait {}s chat_id={} msg_id={}", e.seconds, chat_id, msg_id)
+        logger.warning("high_priority edit: FloodWait {}s chat_id={} chat={} msg_id={} msg_date={}", e.seconds, chat_id, chat_label, msg_id, date_label)
         await asyncio.sleep(int(e.seconds) + 1)
         if entities is not None and file is None:
             peer = await client.get_input_entity(chat_id)
@@ -636,7 +676,7 @@ async def safe_edit_high_priority(
                 edit_kw["file"] = str(file)
             await client.edit_message(chat_id, msg_id, text_trimmed, **edit_kw)
     except Exception as e:
-        logger.warning("high_priority edit failed chat_id={} msg_id={}: {}", chat_id, msg_id, e)
+        logger.warning("high_priority edit failed chat_id={} chat={} msg_id={} msg_date={}: {}", chat_id, chat_label, msg_id, date_label, e)
         raise
 
 
@@ -728,6 +768,8 @@ async def process_transcription_job(
             state.chat_id,
             state.cmd_msg_id,
             build_progress_text(state.stage, state.pct, state.done_ts, state.note),
+            chat_label,
+            msg_date_str,
         )
 
     async def try_high_edit(text: str, file: Optional[Path] = None, entities: Optional[List] = None) -> bool:
@@ -736,6 +778,7 @@ async def process_transcription_job(
             await safe_edit_high_priority(
                 client, chat_id, cmd_msg_id, text,
                 scheduler=scheduler, file=file, entities=entities,
+                chat_title=chat_label, msg_date_str=msg_date_str,
             )
             return True
         except Exception as e:
@@ -874,6 +917,8 @@ async def process_transcription_job(
                             state.chat_id,
                             state.cmd_msg_id,
                             build_progress_text("transcribe", pct, done_ts_predicted, None),
+                            chat_label,
+                            msg_date_str,
                         )
             return "".join(out_chunks).strip(), {
                 "language": getattr(info, "language", None),
@@ -916,7 +961,10 @@ async def process_transcription_job(
         )
 
     except Exception as e:
-        logger.exception("job chat_id={} cmd_msg_id={} failed: {}", chat_id, cmd_msg_id, e)
+        logger.exception(
+            "job chat_id={} chat={} cmd_msg_id={} cmd_msg_date={} failed: {}",
+            chat_id, chat_label, cmd_msg_id, msg_date_str, e,
+        )
         await try_high_edit(format_error(e))
     finally:
         # гарантированная уборка временных файлов/директории
@@ -971,6 +1019,7 @@ async def process_upgrade_job(
             await safe_edit_high_priority(
                 client, chat_id, cmd_msg_id, text,
                 scheduler=scheduler, file=file, entities=entities,
+                chat_title=chat_label, msg_date_str=msg_date_str,
             )
             return True
         except Exception as e:
@@ -1029,7 +1078,10 @@ async def process_upgrade_job(
             await try_high_edit(attach_msg, file=txt_path)
         logger.info("upgrade job completed chat_id={} chat={} cmd_msg_id={} cmd_msg_date={}", chat_id, chat_label, cmd_msg_id, msg_date_str)
     except Exception as e:
-        logger.exception("upgrade job chat_id={} cmd_msg_id={} failed: {}", chat_id, cmd_msg_id, e)
+        logger.exception(
+            "upgrade job chat_id={} chat={} cmd_msg_id={} cmd_msg_date={} failed: {}",
+            chat_id, chat_label, cmd_msg_id, msg_date_str, e,
+        )
         await try_high_edit(format_error(e))
     finally:
         try:
@@ -1299,13 +1351,22 @@ async def main() -> None:
                 client, chat_id, cmd_msg_id,
                 get_tr_help_text()[:TELEGRAM_MAX_MESSAGE_LEN],
                 scheduler=scheduler,
+                chat_title=chat_title, msg_date_str=msg_date_str,
             )
             return
         if cmd.get("destruct_message"):
+            # Удаляется только одно сообщение — то, что вызвало команду (один чат, один msg_id).
             try:
                 await event.message.delete()
+                logger.debug(
+                    "deleted message chat_id={} chat={} msg_id={} msg_date={}",
+                    chat_id, chat_title, cmd_msg_id, msg_date_str,
+                )
             except Exception as e:
-                logger.warning("failed to delete message: {}", e)
+                logger.warning(
+                    "failed to delete message chat_id={} chat={} msg_id={} msg_date={}: {}",
+                    chat_id, chat_title, cmd_msg_id, msg_date_str, e,
+                )
             return
         sub = cmd.get("subscribe")
         sub_ra = cmd.get("subscribe_record_audio")
@@ -1352,6 +1413,7 @@ async def main() -> None:
                     client, chat_id, cmd_msg_id,
                     "🤖 Транскрипция провалена из-за ошибки:\n```\nКоманда должна быть reply на сообщение с медиа\n```",
                     scheduler=scheduler,
+                    chat_title=chat_title, msg_date_str=msg_date_str,
                 )
             return
 
