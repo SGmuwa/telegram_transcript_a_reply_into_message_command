@@ -321,6 +321,27 @@ SUBSCRIBE_KEY_LABELS = {
 }
 
 
+async def fill_missing_chat_names(client: TelegramClient, subscriptions: Dict[str, Dict[str, Any]]) -> None:
+    """Для чатов без названия запрашивает его через API и сохраняет обновлённый JSON."""
+    updated = False
+    for ckey in list(subscriptions.keys()):
+        sub = subscriptions[ckey]
+        if sub.get("name") and str(sub.get("name", "")).strip():
+            continue
+        try:
+            peer_id = int(ckey)
+            entity = await client.get_entity(peer_id)
+            name = _chat_display_name(entity)
+            if name and name != "?":
+                sub["name"] = name
+                updated = True
+                logger.debug("tr_show_list: filled name for chat_id={}: {}", ckey, name)
+        except Exception as e:
+            logger.debug("tr_show_list: could not get name for chat_id={}: {}", ckey, e)
+    if updated:
+        save_tr_subscriptions(subscriptions)
+
+
 def get_tr_show_list_text(subscriptions: Dict[str, Dict[str, Any]]) -> str:
     """Формирует текст списка чатов с подпиской (для команды /tr_show_list)."""
     if not subscriptions:
@@ -1204,6 +1225,7 @@ async def startup_scan_and_resume(
             dialogs_scanned += 1
             chat_title = _chat_display_name(dialog)
             try:
+                logger.debug("startup scan: iter_messages dialog.entity={} from_user=me limit=200", dialog.entity)
                 async for message in client.iter_messages(dialog.entity, from_user="me", limit=200):
                     msg_dt = message.date if message.date and message.date.tzinfo else (message.date.replace(tzinfo=timezone.utc) if message.date else None)
                     if not msg_dt or msg_dt < cutoff_utc:
@@ -1380,6 +1402,7 @@ async def main() -> None:
         )
 
         if cmd.get("show_list"):
+            await fill_missing_chat_names(client, tr_subscriptions)
             list_text = get_tr_show_list_text(tr_subscriptions)
             await safe_edit_high_priority(
                 client, chat_id, cmd_msg_id,
