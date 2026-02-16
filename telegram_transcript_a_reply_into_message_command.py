@@ -33,7 +33,7 @@ logger.add(sys.stderr, level=LOG_LEVEL, format="<green>{time:YYYY-MM-DD HH:mm:ss
 # Defaults (можно переопределять env-ами и через команду)
 DEFAULT_MODEL_NAME = os.getenv("DEFAULT_MODEL_NAME", "large")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ru")
-DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Europe/Moscow")
+TZ = os.getenv("TZ", "Europe/Moscow")
 LOW_PRIORITY_EDIT_INTERVAL_SECONDS = int(os.getenv("LOW_PRIORITY_EDIT_INTERVAL_SECONDS", "120"))
 
 TEMP_DIR = Path(os.getenv("TEMP_DIR", "./.tmp")).resolve()
@@ -114,10 +114,14 @@ def _chat_display_name(chat_or_dialog) -> str:
 
 
 def _msg_date_str(dt: Optional[datetime]) -> str:
-    """Дата сообщения для логов (ISO или —)."""
+    """Дата сообщения для логов в таймзоне TZ (или —)."""
     if not dt:
         return "—"
-    return dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+    try:
+        dt_aware = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return datetime_in_tz(dt_aware, TZ)
+    except Exception:
+        return dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
 
 
 def now_in_tz(tz_name: str) -> str:
@@ -126,7 +130,7 @@ def now_in_tz(tz_name: str) -> str:
         zi = ZoneInfo(tz_name)
         return datetime.now(zi).strftime("%Y-%m-%d %H:%M:%S %z")
     except Exception:
-        zi = ZoneInfo(DEFAULT_TZ)
+        zi = ZoneInfo(TZ)
         return datetime.now(zi).strftime("%Y-%m-%d %H:%M:%S %z")
 
 
@@ -136,7 +140,7 @@ def datetime_in_tz(dt: datetime, tz_name: str) -> str:
         zi = ZoneInfo(tz_name)
         return dt.astimezone(zi).strftime("%Y-%m-%d %H:%M:%S %z")
     except Exception:
-        zi = ZoneInfo(DEFAULT_TZ)
+        zi = ZoneInfo(TZ)
         return dt.astimezone(zi).strftime("%Y-%m-%d %H:%M:%S %z")
 
 
@@ -181,6 +185,7 @@ def ensure_secrets_example(secrets_dir: Path) -> None:
                 "# (Опционально) дефолты:",
                 "# DEFAULT_MODEL_NAME=large",
                 "# DEFAULT_LANG=ru",
+                "# TZ=Europe/Moscow",
                 "",
                 "# (Опционально) whisper runtime:",
                 "# WHISPER_DEVICE=cpu",
@@ -959,7 +964,7 @@ async def process_upgrade_job(
     txt_path = job_dir / "transcription.txt"
     model_name = DEFAULT_MODEL_NAME
     lang_force, lang_allowed = normalize_lang(DEFAULT_LANG)
-    tz_name = DEFAULT_TZ
+    tz_name = TZ
 
     async def try_high_edit(text: str, file: Optional[Path] = None, entities: Optional[List] = None) -> bool:
         try:
@@ -1078,7 +1083,7 @@ async def startup_scan_and_resume(
                 model_name=DEFAULT_MODEL_NAME,
                 lang_force=normalize_lang(DEFAULT_LANG)[0],
                 lang_allowed=normalize_lang(DEFAULT_LANG)[1],
-                tz_name=DEFAULT_TZ,
+                tz_name=TZ,
                 is_resume=True,
                 chat_title=chat_title or None,
                 cmd_msg_date=cmd_msg_date,
@@ -1356,7 +1361,7 @@ async def main() -> None:
 
         model_name = cmd.get("model") or DEFAULT_MODEL_NAME
         lang_force, lang_allowed = normalize_lang(cmd.get("lang"))
-        tz_name = cmd.get("tz") or DEFAULT_TZ
+        tz_name = cmd.get("tz") or TZ
         logger.debug("starting transcription task: model={} lang_force={} lang_allowed={} tz={}", model_name, lang_force, lang_allowed, tz_name)
 
         # отдельная задача на обработку, чтобы не блокировать обработчик событий

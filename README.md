@@ -21,7 +21,7 @@
 |----------|----------|--------------|
 | `model` | Модель Whisper (tiny, base, small, medium, large, turbo и др.) | `large` (или `DEFAULT_MODEL_NAME` из env) |
 | `lang` | Язык: один (`ru`) или список допустимых (`ru,en`) | `ru` (или `DEFAULT_LANG`) |
-| `tz` | Таймзона для дат в прогрессе (например Europe/Moscow) | `Europe/Moscow` (или `DEFAULT_TZ`) |
+| `tz` | Таймзона для дат в прогрессе (например Europe/Moscow) | `Europe/Moscow` (или `TZ` из env) |
 
 ## Запуск
 
@@ -44,7 +44,7 @@
 
 ## Переменные окружения (опционально)
 
-- `DEFAULT_MODEL_NAME`, `DEFAULT_LANG`, `DEFAULT_TZ` — значения по умолчанию для команды
+- `DEFAULT_MODEL_NAME`, `DEFAULT_LANG`, `TZ` — значения по умолчанию для команды (TZ также используется для дат в логах)
 - `LOW_PRIORITY_EDIT_INTERVAL_SECONDS` — интервал обновления прогресса (по умолчанию 120 с)
 - `WHISPER_DEVICE` (cpu/cuda), `WHISPER_COMPUTE_TYPE` (int8/float16 и др.)
 - `LOG_LEVEL` — уровень логирования (DEBUG по умолчанию)
