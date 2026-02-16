@@ -1354,20 +1354,6 @@ async def main() -> None:
                 chat_title=chat_title, msg_date_str=msg_date_str,
             )
             return
-        if cmd.get("destruct_message"):
-            # Удаляется только одно сообщение — то, что вызвало команду (один чат, один msg_id).
-            try:
-                await event.message.delete()
-                logger.debug(
-                    "deleted message chat_id={} chat={} msg_id={} msg_date={}",
-                    chat_id, chat_title, cmd_msg_id, msg_date_str,
-                )
-            except Exception as e:
-                logger.warning(
-                    "failed to delete message chat_id={} chat={} msg_id={} msg_date={}: {}",
-                    chat_id, chat_title, cmd_msg_id, msg_date_str, e,
-                )
-            return
         sub = cmd.get("subscribe")
         sub_ra = cmd.get("subscribe_record_audio")
         sub_rv = cmd.get("subscribe_record_video")
@@ -1399,6 +1385,20 @@ async def main() -> None:
                 tr_subscriptions.pop(ckey, None)
             save_tr_subscriptions(tr_subscriptions)
             logger.debug("tr subscriptions updated for chat_id={} chat={}: {}", chat_id, chat_title, current)
+        if cmd.get("destruct_message"):
+            # Удаляется только одно сообщение — то, что вызвало команду (один чат, один msg_id).
+            try:
+                await event.message.delete()
+                logger.debug(
+                    "deleted message chat_id={} chat={} msg_id={} msg_date={}",
+                    chat_id, chat_title, cmd_msg_id, msg_date_str,
+                )
+            except Exception as e:
+                logger.warning(
+                    "failed to delete message chat_id={} chat={} msg_id={} msg_date={}: {}",
+                    chat_id, chat_title, cmd_msg_id, msg_date_str, e,
+                )
+            return
 
         if not event.is_reply:
             no_subscribe_update = (
