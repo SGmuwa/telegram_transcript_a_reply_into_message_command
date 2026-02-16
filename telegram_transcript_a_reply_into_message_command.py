@@ -73,8 +73,8 @@ def _parse_bool(v: Optional[str]) -> Optional[bool]:
     return None
 
 
-def load_tr_subscriptions() -> Dict[str, Dict[str, bool]]:
-    """Загружает подписки из JSON. Ключ — str(chat_id)."""
+def load_tr_subscriptions() -> Dict[str, Dict[str, Any]]:
+    """Загружает подписки из JSON. Ключ — str(chat_id). Значение: флаги SUBSCRIBE_KEYS и опционально "name" — название чата."""
     if not TR_SUBSCRIPTIONS_FILE.exists():
         return {}
     try:
@@ -84,14 +84,18 @@ def load_tr_subscriptions() -> Dict[str, Dict[str, bool]]:
         for cid, sub in chats.items():
             if not isinstance(sub, dict):
                 continue
-            out[str(cid)] = {k: bool(sub.get(k, False)) for k in SUBSCRIBE_KEYS}
+            row = {k: bool(sub.get(k, False)) for k in SUBSCRIBE_KEYS}
+            if "name" in sub and isinstance(sub.get("name"), str):
+                row["name"] = sub["name"]
+            out[str(cid)] = row
         return out
     except Exception as e:
         logger.warning("failed to load tr_subscriptions: {}", e)
         return {}
 
 
-def save_tr_subscriptions(subscriptions: Dict[str, Dict[str, bool]]) -> None:
+def save_tr_subscriptions(subscriptions: Dict[str, Dict[str, Any]]) -> None:
+    """Сохраняет подписки в JSON (включая название чата "name" для удобства)."""
     TR_SUBSCRIPTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
     TR_SUBSCRIPTIONS_FILE.write_text(
         json.dumps({"chats": subscriptions}, ensure_ascii=False, indent=2),
@@ -206,10 +210,13 @@ def parse_command(text: str) -> Optional[dict]:
     /tr model=large lang=ru,en
     /transcription model=tiny lang=en
     /tr subscribe=True help=True ...
+    /tr_show_list — показать список чатов с подпиской
     """
     if not text:
         return None
     t = text.strip()
+    if t.startswith("/tr_show_list") or t.startswith("/tr_show_list@"):
+        return {"cmd": "/tr_show_list", "show_list": True}
     if not (t.startswith("/tr") or t.startswith("/transcription") or t.startswith("/ts")):
         return None
 
@@ -301,7 +308,33 @@ def get_tr_help_text() -> str:
 • subscribe_audio=True/False — музыка/аудио
 • subscribe_video=True/False — видео
 • destruct_message=True — не транскрибировать, удалить отправленное сообщение (удобно для подписки)
-• help=True — эта справка (без транскрипции)"""
+• help=True — эта справка (без транскрипции)
+• /tr_show_list — список чатов с подпиской"""
+
+
+# Краткие названия режимов подписки для вывода в /tr_show_list
+SUBSCRIBE_KEY_LABELS = {
+    SUBSCRIBE_RECORD_AUDIO: "голосовые",
+    SUBSCRIBE_RECORD_VIDEO: "видеосообщения",
+    SUBSCRIBE_AUDIO: "аудио",
+    SUBSCRIBE_VIDEO: "видео",
+}
+
+
+def get_tr_show_list_text(subscriptions: Dict[str, Dict[str, Any]]) -> str:
+    """Формирует текст списка чатов с подпиской (для команды /tr_show_list)."""
+    if not subscriptions:
+        return "Чаты с подпиской на авто-транскрипцию:\n\n(пусто)"
+    lines = ["Чаты с подпиской на авто-транскрипцию:", ""]
+    for ckey in sorted(subscriptions.keys(), key=lambda x: (subscriptions[x].get("name") or "").lower()):
+        sub = subscriptions[ckey]
+        name = sub.get("name") or "(без названия)"
+        active = [SUBSCRIBE_KEY_LABELS.get(k, k) for k in SUBSCRIBE_KEYS if sub.get(k)]
+        mode = ", ".join(active) if active else "—"
+        lines.append(f"• {name} (id={ckey})")
+        lines.append(f"  Режим: {mode}")
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def normalize_lang(lang_value: Optional[str]) -> Tuple[Optional[str], Optional[List[str]]]:
@@ -1346,6 +1379,16 @@ async def main() -> None:
             chat_id, chat_title, cmd_msg_id, msg_date_str, cmd,
         )
 
+        if cmd.get("show_list"):
+            list_text = get_tr_show_list_text(tr_subscriptions)
+            await safe_edit_high_priority(
+                client, chat_id, cmd_msg_id,
+                list_text[:TELEGRAM_MAX_MESSAGE_LEN],
+                scheduler=scheduler,
+                chat_title=chat_title, msg_date_str=msg_date_str,
+            )
+            return
+
         if cmd.get("help"):
             await safe_edit_high_priority(
                 client, chat_id, cmd_msg_id,
@@ -1379,6 +1422,7 @@ async def main() -> None:
                 current[SUBSCRIBE_AUDIO] = sub_a
             if sub_v is not None:
                 current[SUBSCRIBE_VIDEO] = sub_v
+            current["name"] = chat_title
             if any(current.get(k, False) for k in SUBSCRIBE_KEYS):
                 tr_subscriptions[ckey] = current
             else:
