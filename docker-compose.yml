@@ -5,8 +5,10 @@ services:
     container_name: telegram_transcript_a_reply_into_message_command
     restart: unless-stopped
 
-    cpus: "1.0"
-    mem_limit: 512m
+    #cpus: "0.8"
+    #mem_limit: 512m
+
+    stop_grace_period: 1h
 
     env_file:
       - ./secrets/telegram.env
@@ -19,6 +21,7 @@ services:
       - DEFAULT_MODEL_NAME=large
       - DEFAULT_LANG=ru
       - LOW_PRIORITY_EDIT_INTERVAL_SECONDS=120
+      - STOP_GRACE_PERIOD=3500
       - WHISPER_DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=int8
 
