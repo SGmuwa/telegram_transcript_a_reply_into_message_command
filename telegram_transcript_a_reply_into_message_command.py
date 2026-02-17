@@ -1354,7 +1354,7 @@ async def startup_scan_and_resume(
                     run_resume(chat_id, cmd_msg_id, reply_msg, chat_title, cmd_msg_date),
                     name=f"resume_{chat_id}_{cmd_msg_id}",
                 )
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
             except Exception as e:
                 logger.warning(
                     "startup resume: failed to get reply chat_id={} chat={} msg_id={} msg_date={}: {}",
@@ -1378,7 +1378,7 @@ async def startup_scan_and_resume(
                     run_upgrade(chat_id, cmd_msg_id, reply_msg, chat_title, cmd_msg_date),
                     name=f"upgrade_{chat_id}_{cmd_msg_id}",
                 )
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
             except Exception as e:
                 logger.warning(
                     "startup upgrade: failed to get reply chat_id={} chat={} msg_id={} msg_date={}: {}",
