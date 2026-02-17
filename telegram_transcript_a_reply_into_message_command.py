@@ -1331,6 +1331,14 @@ async def startup_scan_and_resume(
                                 "startup scan: candidate upgrade chat_id={} chat={} cmd_msg_id={} cmd_msg_date={} reply_id={} (msg_model={} < default={})",
                                 dialog.id, chat_title, message.id, _msg_date_str(message.date), reply_id, msg_model, DEFAULT_MODEL_NAME,
                             )
+                    elif has_transcription and _is_completed_transcription_worse_than_default(text):
+                        # Финальное сообщение уже отредактировано (начинается с 🤖, без /tr) — тоже берём в upgrade
+                        msg_model = parse_transcription_message_model(text)
+                        to_upgrade.append((dialog.id, message.id, reply_id, chat_title, message.date))
+                        logger.debug(
+                            "startup scan: candidate upgrade (final form) chat_id={} chat={} cmd_msg_id={} cmd_msg_date={} reply_id={} (msg_model={} < default={})",
+                            dialog.id, chat_title, message.id, _msg_date_str(message.date), reply_id, msg_model, DEFAULT_MODEL_NAME,
+                        )
             except Exception as e:
                 logger.warning("startup scan: error iterating dialog {}: {}", getattr(dialog, "name", dialog.id), e)
                 continue
