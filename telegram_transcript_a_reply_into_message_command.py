@@ -213,12 +213,26 @@ def parse_command(text: str) -> Optional[dict]:
     /transcription model=tiny lang=en
     /tr subscribe=True help=True ...
     /tr_show_list — показать список чатов с подпиской
+    /tr_show_tasks — показать текущие задания
     """
     if not text:
         return None
     t = text.strip()
+    if t.startswith("/tr_show_tasks") or t.startswith("/tr_show_tasks@"):
+        return {"cmd": "/tr_show_tasks", "show_tasks": True}
     if t.startswith("/tr_show_list") or t.startswith("/tr_show_list@"):
-        return {"cmd": "/tr_show_list", "show_list": True}
+        args_show: Dict[str, Any] = {"cmd": "/tr_show_list", "show_list": True, "format": "text"}
+        try:
+            parts_show = shlex.split(t)
+            for p in parts_show[1:]:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    k, v = k.strip().lower(), v.strip().lower()
+                    if k == "format" and v in ("text", "json"):
+                        args_show["format"] = v
+        except Exception:
+            pass
+        return args_show
     if not (t.startswith("/tr") or t.startswith("/transcription") or t.startswith("/ts")):
         return None
 
@@ -311,7 +325,8 @@ def get_tr_help_text() -> str:
 • subscribe_video=True/False — видео
 • destruct_message=True — не транскрибировать, удалить отправленное сообщение (удобно для подписки)
 • help=True — эта справка (без транскрипции)
-• /tr_show_list — список чатов с подпиской"""
+• /tr_show_list — список чатов с подпиской (format=text | format=json, по умолчанию text)
+• /tr_show_tasks — текущие задания (транскрипция, апгрейд, scheduler и т.д.)"""
 
 
 # Краткие названия режимов подписки для вывода в /tr_show_list
@@ -345,7 +360,7 @@ async def fill_missing_chat_names(client: TelegramClient, subscriptions: Dict[st
 
 
 def get_tr_show_list_text(subscriptions: Dict[str, Dict[str, Any]]) -> str:
-    """Формирует текст списка чатов с подпиской (для команды /tr_show_list)."""
+    """Формирует текст списка чатов с подпиской (для команды /tr_show_list format=text)."""
     if not subscriptions:
         return "Чаты с подпиской на авто-транскрипцию:\n\n(пусто)"
     lines = ["Чаты с подпиской на авто-транскрипцию:", ""]
@@ -358,6 +373,32 @@ def get_tr_show_list_text(subscriptions: Dict[str, Dict[str, Any]]) -> str:
         lines.append(f"  Режим: {mode}")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def get_tr_show_list_json(subscriptions: Dict[str, Dict[str, Any]]) -> str:
+    """Формирует JSON списка чатов с подпиской (для команды /tr_show_list format=json)."""
+    return json.dumps({"chats": subscriptions}, ensure_ascii=False, indent=2)
+
+
+def get_tr_show_tasks_text() -> str:
+    """Формирует текст списка текущих заданий (для команды /tr_show_tasks). Вызывать из async-контекста."""
+    loop = asyncio.get_running_loop()
+    current = asyncio.current_task()
+    tasks = [t for t in asyncio.all_tasks(loop) if t is not current and not t.done()]
+
+    def _label(t: asyncio.Task) -> str:
+        if hasattr(t, "get_name"):
+            name = t.get_name()
+            if name:
+                return name
+        return repr(t.get_coro())
+
+    if not tasks:
+        return "Текущие задания:\n\n(нет)"
+    lines = ["Текущие задания:", ""]
+    for t in sorted(tasks, key=_label):
+        lines.append("• " + _label(t))
+    return "\n".join(lines)
 
 
 def normalize_lang(lang_value: Optional[str]) -> Tuple[Optional[str], Optional[List[str]]]:
@@ -1467,10 +1508,24 @@ async def main() -> None:
 
         if cmd.get("show_list"):
             await fill_missing_chat_names(client, tr_subscriptions)
-            list_text = get_tr_show_list_text(tr_subscriptions)
+            fmt = cmd.get("format") or "text"
+            if fmt == "json":
+                list_text = get_tr_show_list_json(tr_subscriptions)
+            else:
+                list_text = get_tr_show_list_text(tr_subscriptions)
             await safe_edit_high_priority(
                 client, chat_id, cmd_msg_id,
                 list_text[:TELEGRAM_MAX_MESSAGE_LEN],
+                scheduler=scheduler,
+                chat_title=chat_title, msg_date_str=msg_date_str,
+            )
+            return
+
+        if cmd.get("show_tasks"):
+            tasks_text = get_tr_show_tasks_text()
+            await safe_edit_high_priority(
+                client, chat_id, cmd_msg_id,
+                tasks_text[:TELEGRAM_MAX_MESSAGE_LEN],
                 scheduler=scheduler,
                 chat_title=chat_title, msg_date_str=msg_date_str,
             )
