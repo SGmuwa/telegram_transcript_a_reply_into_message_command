@@ -56,6 +56,10 @@ RESUME_SEMAPHORE_LIMIT = 3
 # Файл подписок для /tr (в SESSION_DIR — переживает docker compose down/up)
 TR_SUBSCRIPTIONS_FILE = Path(os.getenv("TR_SUBSCRIPTIONS_FILE", str(SESSION_DIR / "tr_subscriptions.json"))).resolve()
 
+# Время последнего начала работы задания (для расчёта cutoff при скане resume/upgrade)
+LAST_WORK_STARTED_FILE = Path(os.getenv("LAST_WORK_STARTED_FILE", str(SESSION_DIR / "last_work_started.txt"))).resolve()
+LAST_WORK_STARTED_OVERLAP_HOURS = 12  # при старте ищем сообщения с max(now-7d, last_saved - 12h)
+
 # Ключи подписок по типам медиа
 SUBSCRIBE_RECORD_AUDIO = "subscribe_record_audio"  # голосовые
 SUBSCRIBE_RECORD_VIDEO = "subscribe_record_video"  # видеосообщения
@@ -103,6 +107,33 @@ def save_tr_subscriptions(subscriptions: Dict[str, Dict[str, Any]]) -> None:
         json.dumps({"chats": subscriptions}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def load_last_work_started() -> Optional[datetime]:
+    """Читает дату/время последнего начала задания с диска (UTC)."""
+    if not LAST_WORK_STARTED_FILE.exists():
+        return None
+    try:
+        s = LAST_WORK_STARTED_FILE.read_text(encoding="utf-8").strip()
+        if not s:
+            return None
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception as e:
+        logger.debug("load_last_work_started failed: {}", e)
+        return None
+
+
+def save_last_work_started() -> None:
+    """Сохраняет текущее время (UTC) как момент начала работы задания."""
+    try:
+        LAST_WORK_STARTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        now_utc = datetime.now(timezone.utc)
+        LAST_WORK_STARTED_FILE.write_text(now_utc.isoformat(), encoding="utf-8")
+    except Exception as e:
+        logger.debug("save_last_work_started failed: {}", e)
 
 
 def now_local_str() -> str:
@@ -879,6 +910,7 @@ async def process_transcription_job(
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     job_dir = TEMP_DIR / f"job_{chat_id}_{cmd_msg_id}"
     job_dir.mkdir(parents=True, exist_ok=True)
+    save_last_work_started()
     chat_label = chat_title or str(chat_id)
     msg_date_str = _msg_date_str(cmd_msg_date)
     logger.info(
@@ -1129,6 +1161,7 @@ async def process_upgrade_job(
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
     job_dir = TEMP_DIR / f"upgrade_{chat_id}_{cmd_msg_id}"
     job_dir.mkdir(parents=True, exist_ok=True)
+    save_last_work_started()
     chat_label = chat_title or str(chat_id)
     msg_date_str = _msg_date_str(cmd_msg_date)
     logger.info(
@@ -1246,8 +1279,16 @@ async def startup_scan_and_resume(
         RESUME_UPGRADE_MAX_AGE_DAYS,
         RESUME_SEMAPHORE_LIMIT,
     )
-    cutoff_utc = (datetime.now().astimezone() - timedelta(days=RESUME_UPGRADE_MAX_AGE_DAYS)).astimezone(timezone.utc)
-    logger.debug("startup scan: cutoff_utc={}", cutoff_utc.isoformat())
+    now_utc = datetime.now(timezone.utc)
+    cutoff_max_7d = now_utc - timedelta(days=RESUME_UPGRADE_MAX_AGE_DAYS)
+    last_saved = load_last_work_started()
+    if last_saved is not None:
+        cutoff_from_disk = last_saved - timedelta(hours=LAST_WORK_STARTED_OVERLAP_HOURS)
+        cutoff_utc = max(cutoff_max_7d, cutoff_from_disk)
+        logger.debug("startup scan: last_work_started={} cutoff_from_disk={} cutoff_utc={}", last_saved.isoformat(), cutoff_from_disk.isoformat(), cutoff_utc.isoformat())
+    else:
+        cutoff_utc = cutoff_max_7d
+        logger.debug("startup scan: no last_work_started file, cutoff_utc={}", cutoff_utc.isoformat())
     resume_sem = asyncio.Semaphore(RESUME_SEMAPHORE_LIMIT)
     upgrade_sem = asyncio.Semaphore(RESUME_SEMAPHORE_LIMIT)
 
