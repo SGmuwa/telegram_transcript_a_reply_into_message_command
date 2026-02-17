@@ -19,7 +19,7 @@ from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageEditTimeExpiredError, MessageNotModifiedError
 from telethon.tl.functions.messages import EditMessageRequest, SearchGlobalRequest
-from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, MessageEntityBlockquote
+from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, MessageEntityBlockquote, PeerUser
 from telethon.utils import get_peer_id
 
 from faster_whisper import WhisperModel
@@ -53,6 +53,8 @@ TELEGRAM_MAX_MESSAGE_LEN = 4096  # безопасно считать 4096
 MODEL_ORDER = ("tiny", "base", "small", "medium", "turbo", "large")
 RESUME_UPGRADE_MAX_AGE_DAYS = 7
 RESUME_SEMAPHORE_LIMIT = 3
+# В личных чатах (DM) сообщения можно редактировать только 48 часов — старше не берём в resume/upgrade при старте
+DM_EDIT_MAX_HOURS = 48
 
 # Файл подписок для /tr (в SESSION_DIR — переживает docker compose down/up)
 TR_SUBSCRIPTIONS_FILE = Path(os.getenv("TR_SUBSCRIPTIONS_FILE", str(SESSION_DIR / "tr_subscriptions.json"))).resolve()
@@ -1388,6 +1390,15 @@ async def startup_scan_and_resume(
                 chat_entity = entities.get(chat_id)
                 chat_title = _chat_display_name(chat_entity) if chat_entity else str(chat_id)
                 msg_date = getattr(message, "date", None)
+                # В личных чатах редактирование возможно только 48 часов — старше не обрабатываем (MESSAGE_EDIT_TIME_EXPIRED)
+                if isinstance(message.peer_id, PeerUser) and msg_date:
+                    msg_dt = msg_date if getattr(msg_date, "tzinfo", None) else msg_date.replace(tzinfo=timezone.utc)
+                    if (now_utc - msg_dt) > timedelta(hours=DM_EDIT_MAX_HOURS):
+                        logger.debug(
+                            "startup scan: skip DM older than {}h chat_id={} cmd_msg_id={} msg_date={}",
+                            DM_EDIT_MAX_HOURS, chat_id, message.id, _msg_date_str(msg_date),
+                        )
+                        continue
                 has_transcription = "🤖 Транскрипция:" in text or "🤖 Транскрипция (model" in text
                 if _text_starts_with_transcription_command(text) and has_transcription:
                     if _is_unfinished_transcription_message(text):
