@@ -1352,6 +1352,7 @@ async def startup_scan_and_resume(
     SEARCH_GLOBAL_LIMIT = 100
     min_ts = int(cutoff_utc.timestamp())
     max_ts = int(now_utc.timestamp())
+    logger.debug("startup scan: search global query={} min_ts={} max_ts={}", SEARCH_GLOBAL_QUERY, min_ts, max_ts)
 
     try:
         offset_rate: int = 0
