@@ -18,8 +18,9 @@ from typing import Dict, Optional, Tuple, List, Set, Any
 from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, MessageEditTimeExpiredError, MessageNotModifiedError
-from telethon.tl.functions.messages import EditMessageRequest
-from telethon.tl.types import MessageEntityBlockquote
+from telethon.tl.functions.messages import EditMessageRequest, SearchGlobalRequest
+from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, MessageEntityBlockquote
+from telethon.utils import get_peer_id
 
 from faster_whisper import WhisperModel
 
@@ -148,6 +149,16 @@ def _chat_display_name(chat_or_dialog) -> str:
     if name:
         return str(name)
     return str(getattr(chat_or_dialog, "id", "?"))
+
+
+def _entities_by_peer_id(chats: List[Any], users: List[Any]) -> Dict[int, Any]:
+    """Строит словарь peer_id -> entity из списков chats и users (результат SearchGlobalRequest)."""
+    out: Dict[int, Any] = {}
+    for u in users or ():
+        out[get_peer_id(u)] = u
+    for c in chats or ():
+        out[get_peer_id(c)] = c
+    return out
 
 
 def _msg_date_str(dt: Optional[datetime]) -> str:
@@ -1335,56 +1346,90 @@ async def startup_scan_and_resume(
     to_resume: List[Tuple[int, int, int, str, Optional[datetime]]] = []
     to_upgrade: List[Tuple[int, int, int, str, Optional[datetime]]] = []
 
-    try:
-        dialogs_scanned = 0
-        async for dialog in client.iter_dialogs():
-            if not getattr(dialog, "entity", None):
-                logger.debug("startup scan: skip dialog (no entity) id={}", getattr(dialog, "id", None))
-                continue
-            dialogs_scanned += 1
-            chat_title = _chat_display_name(dialog)
-            try:
-                logger.debug("startup scan: iter_messages dialog.entity={} from_user=me limit=200", dialog.entity)
-                async for message in client.iter_messages(dialog.entity, from_user="me", limit=200):
-                    msg_dt = message.date if message.date and message.date.tzinfo else (message.date.replace(tzinfo=timezone.utc) if message.date else None)
-                    if not msg_dt or msg_dt < cutoff_utc:
-                        break
-                    if not getattr(message, "out", True):
-                        continue
-                    text = (message.text or message.message or "") if hasattr(message, "text") else (getattr(message, "message", "") or "")
-                    if not text.strip():
-                        continue
-                    reply_id = getattr(message, "reply_to_msg_id", None)
-                    if not reply_id:
-                        continue
-                    has_transcription = "🤖 Транскрипция:" in text or "🤖 Транскрипция (model" in text
-                    if _text_starts_with_transcription_command(text) and has_transcription:
-                        if _is_unfinished_transcription_message(text):
-                            to_resume.append((dialog.id, message.id, reply_id, chat_title, message.date))
-                            logger.debug(
-                                "startup scan: candidate resume chat_id={} chat={} cmd_msg_id={} cmd_msg_date={} reply_id={}",
-                                dialog.id, chat_title, message.id, _msg_date_str(message.date), reply_id,
-                            )
-                        elif _is_completed_transcription_worse_than_default(text):
-                            msg_model = parse_transcription_message_model(text)
-                            to_upgrade.append((dialog.id, message.id, reply_id, chat_title, message.date))
-                            logger.debug(
-                                "startup scan: candidate upgrade chat_id={} chat={} cmd_msg_id={} cmd_msg_date={} reply_id={} (msg_model={} < default={})",
-                                dialog.id, chat_title, message.id, _msg_date_str(message.date), reply_id, msg_model, DEFAULT_MODEL_NAME,
-                            )
-                    elif has_transcription and _is_completed_transcription_worse_than_default(text):
-                        # Финальное сообщение уже отредактировано (начинается с 🤖, без /tr) — тоже берём в upgrade
-                        msg_model = parse_transcription_message_model(text)
-                        to_upgrade.append((dialog.id, message.id, reply_id, chat_title, message.date))
-                        logger.debug(
-                            "startup scan: candidate upgrade (final form) chat_id={} chat={} cmd_msg_id={} cmd_msg_date={} reply_id={} (msg_model={} < default={})",
-                            dialog.id, chat_title, message.id, _msg_date_str(message.date), reply_id, msg_model, DEFAULT_MODEL_NAME,
-                        )
-            except Exception as e:
-                logger.warning("startup scan: error iterating dialog {}: {}", getattr(dialog, "name", dialog.id), e)
-                continue
+    SEARCH_GLOBAL_QUERY = "🤖 Транскрипция"
+    SEARCH_GLOBAL_LIMIT = 100
+    min_ts = int(cutoff_utc.timestamp())
+    max_ts = int(now_utc.timestamp())
 
-        logger.info("startup scan: dialogs_scanned={} to_resume={} to_upgrade={}", dialogs_scanned, len(to_resume), len(to_upgrade))
+    try:
+        offset_rate: int = 0
+        offset_peer: Any = InputPeerEmpty()
+        offset_id: int = 0
+        total_messages_seen = 0
+
+        while True:
+            result = await client(
+                SearchGlobalRequest(
+                    q=SEARCH_GLOBAL_QUERY,
+                    filter=InputMessagesFilterEmpty(),
+                    min_date=min_ts,
+                    max_date=max_ts,
+                    offset_rate=offset_rate,
+                    offset_peer=offset_peer,
+                    offset_id=offset_id,
+                    limit=SEARCH_GLOBAL_LIMIT,
+                )
+            )
+            messages = getattr(result, "messages", None) or []
+            chats = getattr(result, "chats", None) or []
+            users = getattr(result, "users", None) or []
+            entities = _entities_by_peer_id(chats, users)
+
+            for message in messages:
+                if not getattr(message, "out", True):
+                    continue
+                text = (getattr(message, "text", None) or getattr(message, "message", None) or "") or ""
+                if not text.strip():
+                    continue
+                reply_id = getattr(message, "reply_to_msg_id", None)
+                if not reply_id:
+                    continue
+                chat_id = get_peer_id(message.peer_id)
+                chat_entity = entities.get(chat_id)
+                chat_title = _chat_display_name(chat_entity) if chat_entity else str(chat_id)
+                msg_date = getattr(message, "date", None)
+                has_transcription = "🤖 Транскрипция:" in text or "🤖 Транскрипция (model" in text
+                if _text_starts_with_transcription_command(text) and has_transcription:
+                    if _is_unfinished_transcription_message(text):
+                        to_resume.append((chat_id, message.id, reply_id, chat_title, msg_date))
+                        logger.debug(
+                            "startup scan: candidate resume chat_id={} chat={} cmd_msg_id={} cmd_msg_date={} reply_id={}",
+                            chat_id, chat_title, message.id, _msg_date_str(msg_date), reply_id,
+                        )
+                    elif _is_completed_transcription_worse_than_default(text):
+                        msg_model = parse_transcription_message_model(text)
+                        to_upgrade.append((chat_id, message.id, reply_id, chat_title, msg_date))
+                        logger.debug(
+                            "startup scan: candidate upgrade chat_id={} chat={} cmd_msg_id={} cmd_msg_date={} reply_id={} (msg_model={} < default={})",
+                            chat_id, chat_title, message.id, _msg_date_str(msg_date), reply_id, msg_model, DEFAULT_MODEL_NAME,
+                        )
+                elif has_transcription and _is_completed_transcription_worse_than_default(text):
+                    msg_model = parse_transcription_message_model(text)
+                    to_upgrade.append((chat_id, message.id, reply_id, chat_title, msg_date))
+                    logger.debug(
+                        "startup scan: candidate upgrade (final form) chat_id={} chat={} cmd_msg_id={} cmd_msg_date={} reply_id={} (msg_model={} < default={})",
+                        chat_id, chat_title, message.id, _msg_date_str(msg_date), reply_id, msg_model, DEFAULT_MODEL_NAME,
+                    )
+
+            total_messages_seen += len(messages)
+            if not messages or len(messages) < SEARCH_GLOBAL_LIMIT:
+                break
+            last = messages[-1]
+            next_rate = getattr(result, "next_rate", None)
+            if next_rate is not None:
+                offset_rate = next_rate
+            else:
+                last_date = getattr(last, "date", None)
+                offset_rate = int(last_date.timestamp()) if last_date else offset_rate
+            last_peer_entity = entities.get(get_peer_id(last.peer_id))
+            if last_peer_entity is None:
+                logger.debug("startup scan: pagination stop (no entity for last message peer)")
+                break
+            offset_peer = await client.get_input_entity(last_peer_entity)
+            offset_id = last.id
+            logger.debug("startup scan: pagination next offset_rate={} offset_id={}", offset_rate, offset_id)
+
+        logger.info("startup scan: total_messages_seen={} to_resume={} to_upgrade={}", total_messages_seen, len(to_resume), len(to_upgrade))
 
         for chat_id, cmd_msg_id, reply_id, chat_title, cmd_msg_date in to_resume:
             try:
