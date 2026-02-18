@@ -14,16 +14,16 @@ services:
       - ./secrets/telegram.env
 
     environment:
-      - TZ=Europe/Moscow
-      - TEMP_DIR=/tmp/telegram_transcriber
+      - DEFAULT_LANG=ru
+      - DEFAULT_MODEL_NAME=large
+      - LOW_PRIORITY_EDIT_INTERVAL_SECONDS=120
       - MODEL_CACHE_DIR=/models
       - SESSION_DIR=/data/session
-      - DEFAULT_MODEL_NAME=large
-      - DEFAULT_LANG=ru
-      - LOW_PRIORITY_EDIT_INTERVAL_SECONDS=120
       - STOP_GRACE_PERIOD=3500
-      - WHISPER_DEVICE=cpu
+      - TEMP_DIR=/tmp/telegram_transcriber
+      - TZ=Europe/Moscow
       - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_DEVICE=cpu
 
     volumes:
       - whisper_models:/models
