@@ -18,6 +18,7 @@ services:
       - DEFAULT_MODEL_NAME=large
       - LOW_PRIORITY_EDIT_INTERVAL_SECONDS=120
       - MODEL_CACHE_DIR=/models
+      - REACTION_DELAY_S=0
       - SESSION_DIR=/data/session
       - STOP_GRACE_PERIOD=3500
       - TEMP_DIR=/tmp/telegram_transcriber

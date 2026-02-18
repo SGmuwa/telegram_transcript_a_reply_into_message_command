@@ -56,6 +56,10 @@ RESUME_SEMAPHORE_LIMIT = 3
 # В личных чатах (DM) сообщения можно редактировать только 48 часов — старше не берём в resume/upgrade при старте
 DM_EDIT_MAX_HOURS = 48
 
+# Задержка реакции на команды и подписки (сек). При нескольких instance даёт время другому взять сообщение в работу.
+# 0 — реагировать сразу. int/float из REACTION_DELAY_S.
+REACTION_DELAY_S = float(os.getenv("REACTION_DELAY_S", "0"))
+
 # Файл подписок для /tr (в SESSION_DIR — переживает docker compose down/up)
 TR_SUBSCRIPTIONS_FILE = Path(os.getenv("TR_SUBSCRIPTIONS_FILE", str(SESSION_DIR / "tr_subscriptions.json"))).resolve()
 
@@ -1284,6 +1288,10 @@ async def startup_scan_and_resume(
     Фоновая задача при старте: найти за последние 7 дней незавершённые транскрипции и
     завершённые с моделью хуже DEFAULT, поставить их в очередь на дообработку/улучшение.
     Ограничение по одновременным задачам — семафор, чтобы не перегружать Telegram.
+
+    Риск при нескольких instance: два процесса могут взять одно и то же сообщение в resume/upgrade
+    и оба начнут его обрабатывать (дублирование работы, возможные конфликты редактирования).
+    Сейчас этот риск принимается; снижение конкуренции — через REACTION_DELAY_S для команд и подписок.
     """
     if shutdown_requested and shutdown_requested[0]:
         return
@@ -1443,6 +1451,7 @@ async def startup_scan_and_resume(
 
         logger.info("startup scan: total_messages_seen={} to_resume={} to_upgrade={}", total_messages_seen, len(to_resume), len(to_upgrade))
 
+        # При нескольких instance возможна конкуренция: другой процесс мог уже взять то же сообщение в работу.
         for chat_id, cmd_msg_id, reply_id, chat_title, cmd_msg_date in to_resume:
             try:
                 reply_msg = await client.get_messages(chat_id, ids=reply_id)
@@ -1721,24 +1730,44 @@ async def main() -> None:
         tz_name = cmd.get("tz") or TZ
         logger.debug("starting transcription task: model={} lang_force={} lang_allowed={} tz={}", model_name, lang_force, lang_allowed, tz_name)
 
-        # отдельная задача на обработку, чтобы не блокировать обработчик событий
-        asyncio.create_task(
-            process_transcription_job(
-                client=client,
-                scheduler=scheduler,
-                model_cache=model_cache,
-                chat_id=chat_id,
-                cmd_msg_id=cmd_msg_id,
-                reply_msg=reply_msg,
-                model_name=model_name,
-                lang_force=lang_force,
-                lang_allowed=lang_allowed,
-                tz_name=tz_name,
-                chat_title=chat_title,
-                cmd_msg_date=cmd_msg_date,
-            ),
-            name=f"transcription_{chat_id}_{cmd_msg_id}",
-        )
+        async def delayed_command_reaction() -> None:
+            """Ждём REACTION_DELAY_S; если за это время сообщение не отредактировал другой instance — берём в работу."""
+            if REACTION_DELAY_S > 0:
+                await asyncio.sleep(REACTION_DELAY_S)
+            if shutdown_requested[0]:
+                return
+            if REACTION_DELAY_S > 0:
+                try:
+                    fresh = await client.get_messages(chat_id, ids=cmd_msg_id)
+                    if fresh and getattr(fresh, "text", None):
+                        if "🤖 Транскрипция" in (fresh.text or ""):
+                            logger.debug(
+                                "command: skip, message already edited (another instance) chat_id={} chat={} msg_id={}",
+                                chat_id, chat_title, cmd_msg_id,
+                            )
+                            return
+                except Exception as e:
+                    logger.warning("command: re-fetch failed chat_id={} msg_id={}: {}", chat_id, cmd_msg_id, e)
+                    return
+            asyncio.create_task(
+                process_transcription_job(
+                    client=client,
+                    scheduler=scheduler,
+                    model_cache=model_cache,
+                    chat_id=chat_id,
+                    cmd_msg_id=cmd_msg_id,
+                    reply_msg=reply_msg,
+                    model_name=model_name,
+                    lang_force=lang_force,
+                    lang_allowed=lang_allowed,
+                    tz_name=tz_name,
+                    chat_title=chat_title,
+                    cmd_msg_date=cmd_msg_date,
+                ),
+                name=f"transcription_{chat_id}_{cmd_msg_id}",
+            )
+
+        asyncio.create_task(delayed_command_reaction(), name=f"delayed_cmd_{chat_id}_{cmd_msg_id}")
 
     @client.on(events.NewMessage(incoming=True, outgoing=False))
     async def incoming_handler(event: events.NewMessage.Event):
@@ -1758,38 +1787,65 @@ async def main() -> None:
             return
         if not sub.get(media_type, False):
             return
-        try:
-            initial_text = build_progress_text("download", 0, None, None)
-            sent_msg = await client.send_message(
-                chat_id,
-                initial_text,
-                reply_to=event.message.id,
-                silent=True,
-            )
-            logger.debug(
-                "subscription: sent progress message chat_id={} chat={} cmd_msg_id={} media_type={}",
-                chat_id, chat_title, sent_msg.id, media_type,
-            )
-            asyncio.create_task(
-                process_transcription_job(
-                    client=client,
-                    scheduler=scheduler,
-                    model_cache=model_cache,
-                    chat_id=chat_id,
-                    cmd_msg_id=sent_msg.id,
-                    reply_msg=event.message,
-                    model_name=DEFAULT_MODEL_NAME,
-                    lang_force=normalize_lang(DEFAULT_LANG)[0],
-                    lang_allowed=normalize_lang(DEFAULT_LANG)[1],
-                    tz_name=TZ,
-                    is_resume=False,
-                    chat_title=chat_title,
-                    cmd_msg_date=getattr(sent_msg, "date", None),
-                ),
-                name=f"subscription_transcription_{chat_id}_{sent_msg.id}",
-            )
-        except Exception as e:
-            logger.warning("subscription: send or start job failed chat_id={} chat={}: {}", chat_id, chat_title, e)
+        media_msg_id = event.message.id
+
+        async def delayed_subscription_reaction() -> None:
+            """Ждём REACTION_DELAY_S; если за это время другой instance не ответил на медиа — берём в работу."""
+            if REACTION_DELAY_S > 0:
+                await asyncio.sleep(REACTION_DELAY_S)
+            if shutdown_requested[0]:
+                return
+            if REACTION_DELAY_S > 0:
+                try:
+                    async for msg in client.iter_messages(chat_id, min_id=media_msg_id - 1, limit=50):
+                        if getattr(msg, "reply_to_msg_id", None) != media_msg_id:
+                            continue
+                        if not getattr(msg, "out", False):
+                            continue
+                        text = (getattr(msg, "text", None) or getattr(msg, "message", None) or "") or ""
+                        if "🤖 Транскрипция" in text:
+                            logger.debug(
+                                "subscription: skip, reply already exists from another instance chat_id={} chat={} media_msg_id={}",
+                                chat_id, chat_title, media_msg_id,
+                            )
+                            return
+                except Exception as e:
+                    logger.warning("subscription: check existing reply failed chat_id={} media_msg_id={}: {}", chat_id, media_msg_id, e)
+                    return
+            try:
+                initial_text = build_progress_text("download", 0, None, None)
+                sent_msg = await client.send_message(
+                    chat_id,
+                    initial_text,
+                    reply_to=media_msg_id,
+                    silent=True,
+                )
+                logger.debug(
+                    "subscription: sent progress message chat_id={} chat={} cmd_msg_id={} media_type={}",
+                    chat_id, chat_title, sent_msg.id, media_type,
+                )
+                asyncio.create_task(
+                    process_transcription_job(
+                        client=client,
+                        scheduler=scheduler,
+                        model_cache=model_cache,
+                        chat_id=chat_id,
+                        cmd_msg_id=sent_msg.id,
+                        reply_msg=event.message,
+                        model_name=DEFAULT_MODEL_NAME,
+                        lang_force=normalize_lang(DEFAULT_LANG)[0],
+                        lang_allowed=normalize_lang(DEFAULT_LANG)[1],
+                        tz_name=TZ,
+                        is_resume=False,
+                        chat_title=chat_title,
+                        cmd_msg_date=getattr(sent_msg, "date", None),
+                    ),
+                    name=f"subscription_transcription_{chat_id}_{sent_msg.id}",
+                )
+            except Exception as e:
+                logger.warning("subscription: send or start job failed chat_id={} chat={}: {}", chat_id, chat_title, e)
+
+        asyncio.create_task(delayed_subscription_reaction(), name=f"delayed_sub_{chat_id}_{media_msg_id}")
 
     async def wait_shutdown_then_disconnect() -> None:
         await shutdown_event.wait()
