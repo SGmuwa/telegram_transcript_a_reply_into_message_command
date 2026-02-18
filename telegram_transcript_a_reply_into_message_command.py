@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Dict, Optional, Tuple, List, Set, Any
+from getpass import getpass
 
 from loguru import logger
 from telethon import TelegramClient, events
@@ -1561,10 +1562,11 @@ async def main() -> None:
         code = input("Введите код из Telegram: ").strip()
         try:
             await client.sign_in(phone=phone, code=code)
-        except Exception:
+        except Exception as e:
+            logger.error("failed to sign in with phone and code: {}", e)
             # возможно включена 2FA
             if not tg_password:
-                tg_password = input("Введите пароль 2FA (если включен): ").strip()
+                tg_password = getpass("Введите пароль 2FA (если включен): ").strip()
             await client.sign_in(password=tg_password)
 
     me = await client.get_me()
