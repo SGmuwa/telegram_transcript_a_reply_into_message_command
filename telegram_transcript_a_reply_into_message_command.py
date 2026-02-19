@@ -18,7 +18,7 @@ from getpass import getpass
 
 from loguru import logger
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, MessageEditTimeExpiredError, MessageNotModifiedError
+from telethon.errors import FloodWaitError, MessageEditTimeExpiredError, MessageNotModifiedError, SessionPasswordNeededError
 from telethon.tl.functions.messages import EditMessageRequest, SearchGlobalRequest
 from telethon.tl.types import InputMessagesFilterEmpty, InputPeerEmpty, MessageEntityBlockquote, PeerUser
 from telethon.utils import get_peer_id
@@ -1515,7 +1515,7 @@ async def main() -> None:
     env_path = secrets_dir / "telegram.env"
     load_env_file_if_exists(env_path)
 
-    required_secrets = ["TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_PHONE", "TELEGRAM_SESSION_NAME"]
+    required_secrets = ["TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION_NAME"]  # TELEGRAM_PHONE опционален (пустой = вход по QR)
     ok, missing = require_env(required_secrets)
     if not ok:
         logger.warning("missing secrets: {}", ", ".join(missing))
@@ -1539,7 +1539,7 @@ async def main() -> None:
 
     api_id = int(os.environ["TELEGRAM_API_ID"])
     api_hash = os.environ["TELEGRAM_API_HASH"]
-    phone = os.environ["TELEGRAM_PHONE"]
+    phone = (os.getenv("TELEGRAM_PHONE") or "").strip()
     tg_password = os.getenv("TELEGRAM_PASSWORD", "")
     session_name = os.environ["TELEGRAM_SESSION_NAME"]
 
@@ -1557,17 +1557,33 @@ async def main() -> None:
     logger.debug("telegram client connected")
 
     if not await client.is_user_authorized():
-        logger.info("authorization required for phone {}", phone)
-        await client.send_code_request(phone)
-        code = input("Введите код из Telegram: ").strip()
-        try:
-            await client.sign_in(phone=phone, code=code)
-        except Exception as e:
-            logger.error("failed to sign in with phone and code: {}", e)
-            # возможно включена 2FA
-            if not tg_password:
-                tg_password = getpass("Введите пароль 2FA (если включен): ").strip()
-            await client.sign_in(password=tg_password)
+        logger.info("authorization required")
+        use_qr = not (phone or "").strip()
+        code = ""
+        if not use_qr:
+            await client.send_code_request(phone)
+            code = input("Введите код из Telegram (пусто = вход по QR-ссылке): ").strip()
+            use_qr = not code
+        if use_qr:
+            qr = await client.qr_login()
+            logger.info("Вход по QR: откройте ссылку в Telegram (или отсканируйте QR): {}", qr.url)
+            print("Вход по QR:", qr.url)
+            try:
+                await qr.wait()
+            except SessionPasswordNeededError:
+                if not tg_password:
+                    tg_password = getpass("Введите пароль 2FA: ").strip()
+                await client.sign_in(password=tg_password)
+        else:
+            try:
+                await client.sign_in(phone=phone, code=code)
+            except SessionPasswordNeededError:
+                if not tg_password:
+                    tg_password = getpass("Введите пароль 2FA (если включен): ").strip()
+                await client.sign_in(password=tg_password)
+            except Exception as e:
+                logger.error("failed to sign in with phone and code: {}", e)
+                raise
 
     me = await client.get_me()
     username = getattr(me, "username", None)
